@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "grpcio>=1.74.0",
     "grpcio-health-checking>=1.74.0",
+    "grpcio-testing>=1.74.0",
     "grpcio-tools>=1.74.0",
     "kokoro>=0.9.4",
     "ollama>=0.5.3",

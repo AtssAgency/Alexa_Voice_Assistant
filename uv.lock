@@ -18,6 +18,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "grpcio" },
     { name = "grpcio-health-checking" },
+    { name = "grpcio-testing" },
     { name = "grpcio-tools" },
     { name = "kokoro" },
     { name = "ollama" },
@@ -33,6 +34,7 @@ dependencies = [
 requires-dist = [
     { name = "grpcio", specifier = ">=1.74.0" },
     { name = "grpcio-health-checking", specifier = ">=1.74.0" },
+    { name = "grpcio-testing", specifier = ">=1.74.0" },
     { name = "grpcio-tools", specifier = ">=1.74.0" },
     { name = "kokoro", specifier = ">=0.9.4" },
     { name = "ollama", specifier = ">=0.5.3" },
@@ -395,6 +397,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/82/69/87ad1cd826a9f06567bccb66f0c3228a0758ea47a1d35eef15db36b2f492/grpcio_health_checking-1.74.0.tar.gz", hash = "sha256:d6749451d4cef543c3f6260ae9a86c84b9ab02a92421cecae73a632e7fe920bf", size = 16770, upload-time = "2025-07-24T19:02:01.298Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7e/62/2fd797be7514855a0b28f946f57b9a134bba25a9873c269fa730d8fd49d8/grpcio_health_checking-1.74.0-py3-none-any.whl", hash = "sha256:9a6e7bcdf16395105425753d6e3fe31f57cb6ab3f232282254b50f02cc63d9c7", size = 18921, upload-time = "2025-07-24T19:01:24.856Z" },
+]
+
+[[package]]
+name = "grpcio-testing"
+version = "1.74.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/09/71/fd6357c5341bf2ab2a30a24c0331a8c2ac2a387402496d4d868d52578bf9/grpcio_testing-1.74.0.tar.gz", hash = "sha256:11dedb53a410fe3b2a2bc9a9ed9c9a6979420c93243da7d787f7ccf9a2543e37", size = 22492, upload-time = "2025-07-24T19:01:59.403Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/c3/0be099e3bafabb988f6b8f70c7efa2b3440442dbf7f15c7374806211b77a/grpcio_testing-1.74.0-py3-none-any.whl", hash = "sha256:92fa29b053f6921c352c3aef02e95ef7848de9c3e4011d5f646aa5dbbf985c79", size = 33182, upload-time = "2025-07-24T19:01:21.342Z" },
 ]
 
 [[package]]
