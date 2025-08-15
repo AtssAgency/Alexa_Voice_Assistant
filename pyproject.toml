@@ -1,0 +1,12 @@
+[project]
+name = "alexa-new"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "kokoro>=0.9.4",
+    "ollama>=0.5.3",
+    "openai-whisper>=20250625",
+    "openwakeword>=0.4.0",
+]
