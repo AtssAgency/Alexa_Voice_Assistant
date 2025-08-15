@@ -1,5 +1,5 @@
 [system]
-min_vram_mb=8000
+min_vram_mb=7600
 
 [main]
 log_level=INFO
