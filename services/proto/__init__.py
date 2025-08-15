@@ -1,0 +1,1 @@
+"""Protocol Buffer definitions for AI Voice Assistant services"""
