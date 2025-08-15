@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package aivoice.stt;
+
+import "common.proto";
+import "google/protobuf/empty.proto";
+
+// Speech-to-Text service
+service SttService {
+  rpc Configure(SttConfig) returns (ConfigureResponse);
+  rpc Start(aivoice.common.DialogRef) returns (google.protobuf.Empty);
+  rpc Stop(aivoice.common.DialogRef) returns (google.protobuf.Empty);
+  rpc Results(aivoice.common.DialogRef) returns (stream SttResult);
+}
+
+message SttConfig {
+  string device = 1;  // "cuda" or "cpu"
+  string model = 2;   // "small.en"
+  int32 vad_end_silence_ms = 3;
+  int32 max_recording_sec = 4;
+  bool aec_enabled = 5;
+  string aec_backend = 6;  // "webrtc_aec3"
+}
+
+message ConfigureResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SttResult {
+  bool final = 1;
+  string text = 2;
+  string timestamp = 3;
+}

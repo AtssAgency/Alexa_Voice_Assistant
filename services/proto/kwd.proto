@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package aivoice.kwd;
+
+import "common.proto";
+import "google/protobuf/empty.proto";
+
+// Wake Word Detection service
+service KwdService {
+  rpc Configure(KwdConfig) returns (ConfigureResponse);
+  rpc Start(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc Stop(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc Events(google.protobuf.Empty) returns (stream KwdEvent);
+}
+
+message KwdConfig {
+  string model_path = 1;
+  float confidence_threshold = 2;
+  int32 cooldown_ms = 3;
+  repeated string yes_phrases = 4;
+}
+
+message ConfigureResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message KwdEvent {
+  string type = 1;  // "WAKE_DETECTED"
+  float confidence = 2;
+  string timestamp = 3;
+  string dialog_id = 4;
+}

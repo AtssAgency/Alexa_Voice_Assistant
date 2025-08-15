@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package aivoice.tts;
+
+import "common.proto";
+import "llm.proto";
+
+// Text-to-Speech service
+service TtsService {
+  rpc Configure(TtsConfig) returns (ConfigureResponse);
+  rpc Speak(TextInput) returns (TtsPlayAck);
+  rpc SpeakStream(stream aivoice.llm.LlmChunk) returns (TtsPlayAck);
+  rpc PlaybackEvents(aivoice.common.DialogRef) returns (stream TtsEvent);
+}
+
+message TtsConfig {
+  string voice = 1;  // "af_heart"
+  string device = 2; // "cuda" or "cpu"
+  int32 queue_max_chunks = 3;
+  int32 chunk_max_ms = 4;
+}
+
+message ConfigureResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message TextInput {
+  string dialog_id = 1;
+  int32 turn = 2;
+  string text = 3;
+}
+
+message TtsPlayAck {
+  string started_ts = 1;
+}
+
+message TtsEvent {
+  string type = 1;  // "started|chunk_played|underrun|finished|error"
+  string timestamp = 2;
+  string details = 3;
+}

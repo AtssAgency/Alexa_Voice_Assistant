@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package aivoice.logger;
+
+import "google/protobuf/empty.proto";
+
+// Logging service for centralized logging
+service LoggerService {
+  rpc WriteApp(LogEntry) returns (google.protobuf.Empty);
+  rpc WriteDialog(DialogEntry) returns (google.protobuf.Empty);
+  rpc NewDialog(google.protobuf.Empty) returns (NewDialogResponse);
+}
+
+message LogEntry {
+  string timestamp = 1;  // ISO8601
+  string level = 2;      // INFO, WARN, ERROR, FATAL
+  string service = 3;
+  string event = 4;
+  string details = 5;
+}
+
+message DialogEntry {
+  string dialog_id = 1;
+  string speaker = 2;  // "USER" or "ASSISTANT"
+  string text = 3;
+  string timestamp = 4;
+}
+
+message NewDialogResponse {
+  string dialog_id = 1;
+  string log_file_path = 2;
+}
