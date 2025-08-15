@@ -22,7 +22,7 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
-import common_pb2 as common__pb2
+from . import common_pb2 as common__pb2
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tllm.proto\x12\x0b\x61ivoice.llm\x1a\x0c\x63ommon.proto\"|\n\tLlmConfig\x12\x10\n\x08\x65ndpoint\x18\x01 \x01(\t\x12\r\n\x05model\x18\x02 \x01(\t\x12\x16\n\x0emodelfile_path\x18\x03 \x01(\t\x12\x1a\n\x12request_timeout_ms\x18\x04 \x01(\x05\x12\x1a\n\x12stream_chunk_chars\x18\x05 \x01(\x05\"5\n\x11\x43onfigureResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\":\n\tUserQuery\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x11\n\tdialog_id\x18\x02 \x01(\t\x12\x0c\n\x04turn\x18\x03 \x01(\x05\"%\n\x08LlmChunk\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x0b\n\x03\x65ot\x18\x02 \x01(\x08\x32\x8e\x01\n\nLlmService\x12\x43\n\tConfigure\x12\x16.aivoice.llm.LlmConfig\x1a\x1e.aivoice.llm.ConfigureResponse\x12;\n\x08\x43omplete\x12\x16.aivoice.llm.UserQuery\x1a\x15.aivoice.llm.LlmChunk0\x01\x62\x06proto3')

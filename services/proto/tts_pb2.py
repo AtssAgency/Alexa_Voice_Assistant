@@ -22,8 +22,8 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
-import common_pb2 as common__pb2
-import llm_pb2 as llm__pb2
+from . import common_pb2 as common__pb2
+from . import llm_pb2 as llm__pb2
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\ttts.proto\x12\x0b\x61ivoice.tts\x1a\x0c\x63ommon.proto\x1a\tllm.proto\"Z\n\tTtsConfig\x12\r\n\x05voice\x18\x01 \x01(\t\x12\x0e\n\x06\x64\x65vice\x18\x02 \x01(\t\x12\x18\n\x10queue_max_chunks\x18\x03 \x01(\x05\x12\x14\n\x0c\x63hunk_max_ms\x18\x04 \x01(\x05\"5\n\x11\x43onfigureResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\":\n\tTextInput\x12\x11\n\tdialog_id\x18\x01 \x01(\t\x12\x0c\n\x04turn\x18\x02 \x01(\x05\x12\x0c\n\x04text\x18\x03 \x01(\t\" \n\nTtsPlayAck\x12\x12\n\nstarted_ts\x18\x01 \x01(\t\"<\n\x08TtsEvent\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\x11\n\ttimestamp\x18\x02 \x01(\t\x12\x0f\n\x07\x64\x65tails\x18\x03 \x01(\t2\x92\x02\n\nTtsService\x12\x43\n\tConfigure\x12\x16.aivoice.tts.TtsConfig\x1a\x1e.aivoice.tts.ConfigureResponse\x12\x38\n\x05Speak\x12\x16.aivoice.tts.TextInput\x1a\x17.aivoice.tts.TtsPlayAck\x12?\n\x0bSpeakStream\x12\x15.aivoice.llm.LlmChunk\x1a\x17.aivoice.tts.TtsPlayAck(\x01\x12\x44\n\x0ePlaybackEvents\x12\x19.aivoice.common.DialogRef\x1a\x15.aivoice.tts.TtsEvent0\x01\x62\x06proto3')

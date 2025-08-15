@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """
 Script to generate Python gRPC stubs from protobuf definitions.
+Run this script whenever .proto files are modified.
 """
 
 import subprocess
 import sys
 from pathlib import Path
+import re
+
+def fix_imports_in_file(file_path: Path):
+    """Fix absolute imports to relative imports in generated files"""
+    content = file_path.read_text()
+    
+    # Fix imports for pb2 files
+    content = re.sub(r'^import (\w+_pb2) as', r'from . import \1 as', content, flags=re.MULTILINE)
+    
+    # Fix imports for pb2_grpc files  
+    content = re.sub(r'^import (\w+_pb2) as', r'from . import \1 as', content, flags=re.MULTILINE)
+    
+    file_path.write_text(content)
 
 def generate_protos():
     """Generate Python gRPC stubs from all .proto files."""
@@ -33,6 +47,7 @@ def generate_protos():
             f"--proto_path={proto_dir}",
             f"--python_out={output_dir}",
             f"--grpc_python_out={output_dir}",
+            "--pyi_out={}".format(output_dir),
             str(proto_file)
         ]
         
@@ -45,6 +60,16 @@ def generate_protos():
             return False
         else:
             print(f"Successfully generated stubs for {proto_file.name}")
+    
+    # Fix imports in generated files
+    print("\nFixing imports in generated files...")
+    for pb2_file in output_dir.glob("*_pb2.py"):
+        fix_imports_in_file(pb2_file)
+        print(f"Fixed imports in {pb2_file.name}")
+    
+    for grpc_file in output_dir.glob("*_pb2_grpc.py"):
+        fix_imports_in_file(grpc_file)
+        print(f"Fixed imports in {grpc_file.name}")
     
     print("\nAll protobuf stubs generated successfully!")
     return True
