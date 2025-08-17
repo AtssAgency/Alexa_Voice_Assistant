@@ -137,10 +137,15 @@ class RMSService:
     def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
         try:
+            # Add human-readable timestamp (dd-mm-yy HH:MM:SS format)
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%d-%m-%y %H:%M:%S")
+            
             payload = {
                 "svc": "RMS",
                 "level": level,
-                "message": message
+                "message": message,
+                "ts_ms": timestamp
             }
             if event:
                 payload["event"] = event
