@@ -6,20 +6,32 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.116.1",
+    "faster-whisper>=1.2.0",
     "grpcio>=1.74.0",
     "grpcio-health-checking>=1.74.0",
     "grpcio-testing>=1.74.0",
     "grpcio-tools>=1.74.0",
+    "httpx>=0.28.1",
     "kokoro>=0.9.4",
+    "numpy>=2.2.6",
     "ollama>=0.5.3",
+    "onnxruntime>=1.22.1",
     "openai-whisper>=20250625",
     "openwakeword>=0.4.0",
+    "orjson>=3.11.2",
     "protobuf>=6.32.0",
     "psutil>=7.0.0",
     "pyaudio>=0.2.14",
     "pytest>=8.4.1",
     "requests>=2.32.4",
     "scipy>=1.16.1",
+    "sounddevice>=0.5.2",
     "torch>=2.8.0",
+    "torchaudio>=2.8.0",
+    "uvicorn[standard]>=0.35.0",
     "webrtcvad>=2.0.10",
+    "websockets>=15.0.1",
 ]
+
+[tool.uv.sources]
+kokoro = { git = "https://github.com/hexgrad/kokoro" }
