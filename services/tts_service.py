@@ -266,7 +266,8 @@ class TTSService:
             self.tts_engine = Kokoro(
                 model_path=str(model_path),
                 voices_path=str(voices_path),
-                device=device
+                # device=cuda
+                # if device == "cuda" else "cpu",
             )
             
             self.log("info", f"TTS engine initialized with voice {self.voice}, model: {self.model_path}", "model_loaded")
