@@ -37,7 +37,7 @@ import uvicorn
 
 # Import Kokoro TTS components
 try:
-    from kokoro_onnx import KokoroONNX
+    from kokoro_onnx import Kokoro
     KOKORO_AVAILABLE = True
 except ImportError:
     KOKORO_AVAILABLE = False
@@ -117,7 +117,7 @@ class TTSService:
         self.quant_preference = "fp16"
         
         # Kokoro TTS engine
-        self.tts_engine: Optional[KokoroONNX] = None
+        self.tts_engine: Optional[Kokoro] = None
         
         # Audio playback
         self.audio_stream = None
@@ -263,10 +263,9 @@ class TTSService:
             # Initialize Kokoro with model and voices paths
             device = self.device if torch.cuda.is_available() else "cpu"
             
-            self.tts_engine = KokoroONNX(
+            self.tts_engine = Kokoro(
                 model_path=str(model_path),
                 voices_path=str(voices_path),
-                voice=self.voice,
                 device=device
             )
             
@@ -332,7 +331,7 @@ class TTSService:
             start_time = time.time()
             
             # Generate audio using Kokoro
-            audio_data = self.tts_engine.synthesize(text)
+            audio_data = self.tts_engine(text, voice=self.voice)
             
             # Convert to numpy array if needed
             if isinstance(audio_data, torch.Tensor):
