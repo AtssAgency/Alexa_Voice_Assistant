@@ -68,18 +68,15 @@ class MainOrchestrator:
     def start_logger(self) -> bool:
         """Start logger service and wait for it to accept /log requests"""
         try:
-            # Get logger command from config
-            logger_cmd = self.get_main_config('logger_cmd', 'python3 -m services.logger_service')
-            workdir = self.get_main_config('workdir', '.')
+            # Use current Python interpreter for logger
             wait_logger_ms = int(self.get_main_config('wait_logger_ms', '3000'))
             
             # Pre-logger bootstrap message to stdout
             print("MAIN: Starting logger service...")
             
-            # Spawn logger process
+            # Spawn logger process using current interpreter
             self.logger_process = subprocess.Popen(
-                logger_cmd.split(),
-                cwd=workdir,
+                [sys.executable, "-m", "services.logger_service"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
@@ -144,15 +141,11 @@ class MainOrchestrator:
     def start_loader(self) -> bool:
         """Start loader service (process manager)"""
         try:
-            loader_cmd = self.get_main_config('loader_cmd', 'python3 -m services.loader_service')
-            workdir = self.get_main_config('workdir', '.')
-            
             self.log_message("info", "Starting Loader service")
             
-            # Spawn loader process
+            # Spawn loader process using current interpreter
             self.loader_process = subprocess.Popen(
-                loader_cmd.split(),
-                cwd=workdir,
+                [sys.executable, "-m", "services.loader_service"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
@@ -220,10 +213,6 @@ class MainOrchestrator:
             
             # Setup signal handlers
             self.setup_signal_handlers()
-            
-            # Set working directory
-            workdir = self.get_main_config('workdir', '.')
-            os.chdir(workdir)
             
             # STARTING_LOGGER: Start logger first and wait for readiness
             if not self.start_logger():

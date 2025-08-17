@@ -77,8 +77,7 @@ class LoaderService:
         self.vram_probe_cmd = "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits"
         self.warmup_llm = True
         self.greeting_on_ready = True
-        self.workdir = "."
-        self.python = "python3"
+        self.python = sys.executable
         
         # Service management
         self.services: Dict[str, ServiceProcess] = {}
@@ -126,8 +125,10 @@ class LoaderService:
             # Load paths section
             if 'paths' in self.config:
                 paths_section = self.config['paths']
-                self.workdir = paths_section.get('workdir', '.')
-                self.python = paths_section.get('python', 'python3')
+                python_override = paths_section.get('python', None)
+                if python_override:
+                    self.python = python_override
+                # workdir removed - services run from current directory
             
             # Load service configurations
             for section_name in self.config.sections():
@@ -365,7 +366,6 @@ class LoaderService:
             start_time = time.time()
             process = subprocess.Popen(
                 config.cmd.split(),
-                cwd=self.workdir,
                 stdout=open(stdout_file, 'w'),
                 stderr=open(stderr_file, 'w'),
                 preexec_fn=os.setsid  # Create new process group
@@ -636,8 +636,6 @@ class LoaderService:
             # Dry run mode - exit after printing plan
             if self.dry_run:
                 return 0
-            
-            os.chdir(self.workdir)
             
             # Log startup (only after confirming not dry run)
             self.log_to_logger("info", "Loader service started", "service_start")
