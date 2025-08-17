@@ -21,9 +21,10 @@ import psutil
 import requests
 import configparser
 import random
+import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass
 from enum import Enum
 
@@ -64,7 +65,7 @@ class LoaderService:
     def __init__(self):
         self.state = LoaderState.INIT
         self.config: Optional[configparser.ConfigParser] = None
-        self.logger_url = "http://*********:5000"
+        self.logger_url = "http://127.0.0.1:5000"
         
         # Configuration
         self.startup_order = []
@@ -88,6 +89,12 @@ class LoaderService:
         # System timing
         self.system_start_time = None
         self.system_ready_time = None
+        
+        # Selective service options
+        self.execution_plan: List[str] = []
+        self.skip_warmup = False
+        self.skip_greeting = False
+        self.dry_run = False
     
     def load_config(self) -> bool:
         """Load configuration from config/config.ini"""
@@ -141,6 +148,123 @@ class LoaderService:
         except Exception as e:
             print(f"ERROR: Failed to load config: {e}")
             return False
+    
+    def parse_cli_args(self):
+        """Parse command line arguments for selective service bring-up"""
+        parser = argparse.ArgumentParser(description="Alexa FAST Loader Service")
+        
+        parser.add_argument("--only", type=str, help="Start only these services (comma-separated)")
+        parser.add_argument("--skip", type=str, help="Skip these services (comma-separated)")
+        parser.add_argument("--since", type=str, help="Start from this service onwards (inclusive)")
+        parser.add_argument("--until", type=str, help="Stop after this service (inclusive)")
+        parser.add_argument("--no-warmup", action="store_true", help="Skip LLM warmup")
+        parser.add_argument("--no-greeting", action="store_true", help="Skip KWD greeting")
+        parser.add_argument("--dry-run", action="store_true", help="Print plan and exit")
+        
+        args = parser.parse_args()
+        
+        # Check environment variables as fallbacks
+        only = args.only or os.getenv("LOADER_ONLY")
+        skip = args.skip or os.getenv("LOADER_SKIP")
+        since = args.since or os.getenv("LOADER_SINCE")
+        until = args.until or os.getenv("LOADER_UNTIL")
+        no_warmup = args.no_warmup or bool(os.getenv("LOADER_NO_WARMUP"))
+        no_greeting = args.no_greeting or bool(os.getenv("LOADER_NO_GREETING"))
+        
+        return {
+            "only": only,
+            "skip": skip,
+            "since": since,
+            "until": until,
+            "no_warmup": no_warmup,
+            "no_greeting": no_greeting,
+            "dry_run": args.dry_run
+        }
+    
+    def resolve_execution_plan(self, cli_options: Dict[str, Any]) -> List[str]:
+        """Resolve execution plan based on CLI options"""
+        # Start with full startup order
+        full_order = self.startup_order.copy()
+        
+        # Logger is always first and included
+        if "logger" not in full_order:
+            full_order.insert(0, "logger")
+        elif full_order[0] != "logger":
+            full_order.remove("logger")
+            full_order.insert(0, "logger")
+        
+        # Build candidate list (excluding logger which is fixed)
+        candidates = full_order[1:]
+        
+        # Apply --only filter first
+        if cli_options["only"]:
+            only_set = {s.strip().lower() for s in cli_options["only"].split(",")}
+            candidates = [svc for svc in candidates if svc.lower() in only_set]
+        
+        # Apply --since filter
+        if cli_options["since"]:
+            since_svc = cli_options["since"].strip().lower()
+            try:
+                since_index = next(i for i, svc in enumerate(candidates) if svc.lower() == since_svc)
+                candidates = candidates[since_index:]
+            except StopIteration:
+                pass  # Service not found, keep all
+        
+        # Apply --until filter
+        if cli_options["until"]:
+            until_svc = cli_options["until"].strip().lower()
+            try:
+                until_index = next(i for i, svc in enumerate(candidates) if svc.lower() == until_svc)
+                candidates = candidates[:until_index + 1]
+            except StopIteration:
+                pass  # Service not found, keep all
+        
+        # Apply --skip filter
+        if cli_options["skip"]:
+            skip_set = {s.strip().lower() for s in cli_options["skip"].split(",")}
+            candidates = [svc for svc in candidates if svc.lower() not in skip_set]
+        
+        # Final plan: logger + selected candidates
+        plan = ["logger"] + candidates
+        
+        # Set execution options
+        self.skip_warmup = cli_options["no_warmup"]
+        self.skip_greeting = cli_options["no_greeting"]
+        self.dry_run = cli_options["dry_run"]
+        
+        return plan
+    
+    def print_execution_plan(self, plan: List[str], cli_options: Dict[str, Any]):
+        """Print the execution plan"""
+        # Determine what was skipped
+        all_services = set(self.startup_order)
+        planned_services = set(plan)
+        skipped_services = all_services - planned_services
+        
+        # Build plan description
+        plan_str = " → ".join(plan)
+        
+        # Build options description
+        options = []
+        if skipped_services:
+            options.append(f"skip: {','.join(sorted(skipped_services))}")
+        if self.skip_warmup:
+            options.append("no_warmup:true")
+        else:
+            options.append("no_warmup:false")
+        if self.skip_greeting:
+            options.append("no_greeting:true")
+        else:
+            options.append("no_greeting:false")
+        
+        options_str = "; ".join(options) if options else "default"
+        
+        plan_message = f"Plan: {plan_str} ({options_str})"
+        
+        if self.dry_run:
+            print(f"LOADER    INFO  = {plan_message}")
+        else:
+            self.log_to_logger("info", plan_message)
     
     def log_to_logger(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
@@ -333,7 +457,12 @@ class LoaderService:
     
     def warmup_llm(self) -> bool:
         """Warm up LLM service if configured"""
-        if not self.warmup_llm or "llm" not in self.services:
+        # Check if warmup is disabled via CLI or not configured
+        if self.skip_warmup or not self.warmup_llm or "llm" not in self.services:
+            return True
+        
+        # Check if LLM is in execution plan
+        if "llm" not in self.execution_plan:
             return True
             
         llm_config = self.service_configs.get("llm")
@@ -357,11 +486,16 @@ class LoaderService:
     
     def trigger_kwd_greeting(self) -> bool:
         """Trigger KWD greeting after all services ready"""
-        if not self.greeting_on_ready or "kwd" not in self.services:
+        # Check if greeting is disabled via CLI or not configured
+        if self.skip_greeting or not self.greeting_on_ready or "kwd" not in self.services:
+            return True
+        
+        # Check if KWD is in execution plan
+        if "kwd" not in self.execution_plan:
             return True
             
         try:
-            kwd_url = "http://*********:5002/on-system-ready"
+            kwd_url = "http://127.0.0.1:5002/on-system-ready"
             response = requests.post(kwd_url, timeout=5.0)
             
             if response.status_code == 200:
@@ -453,8 +587,8 @@ class LoaderService:
         """Gracefully shutdown all services in reverse order"""
         self.log_to_logger("info", "Shutdown initiated", "shutdown_initiated")
         
-        # Reverse startup order
-        shutdown_order = list(reversed(self.startup_order))
+        # Reverse execution plan order (not full startup order)
+        shutdown_order = list(reversed(self.execution_plan)) if self.execution_plan else list(reversed(self.startup_order))
         
         for service_name in shutdown_order:
             if service_name in self.services:
@@ -486,23 +620,36 @@ class LoaderService:
             self.system_start_time = time.time()
             self.setup_signal_handlers()
             
+            # Parse CLI arguments for selective bring-up
+            cli_options = self.parse_cli_args()
+            
             # INIT: Load configuration
             if not self.load_config():
                 return 1
             
+            # Resolve execution plan
+            self.execution_plan = self.resolve_execution_plan(cli_options)
+            
+            # Print/log execution plan
+            self.print_execution_plan(self.execution_plan, cli_options)
+            
+            # Dry run mode - exit after printing plan
+            if self.dry_run:
+                return 0
+            
             os.chdir(self.workdir)
             
-            # Log startup
+            # Log startup (only after confirming not dry run)
             self.log_to_logger("info", "Loader service started", "service_start")
             
-            # START_SEQUENCE: Start services in order
+            # START_SEQUENCE: Start services in execution plan order
             self.state = LoaderState.START_SEQUENCE
             
-            for service_name in self.startup_order:
+            for service_name in self.execution_plan:
                 if self.shutdown_requested:
                     break
                     
-                self.current_service_index = self.startup_order.index(service_name)
+                self.current_service_index = self.execution_plan.index(service_name)
                 
                 # HEALTH_GATE: Spawn and wait for health
                 self.state = LoaderState.HEALTH_GATE
@@ -528,7 +675,11 @@ class LoaderService:
                 system_ready_duration = (self.system_ready_time - self.system_start_time) * 1000
                 self.send_metric("system_ready_ms", system_ready_duration)
                 
-                self.log_to_logger("info", "All services ready", "all_services_ready")
+                # Log that selected services are ready
+                if len(self.execution_plan) == len(self.startup_order):
+                    self.log_to_logger("info", "All services ready", "all_services_ready")
+                else:
+                    self.log_to_logger("info", "Selected services ready", "selected_services_ready")
                 
                 # Warmup LLM
                 self.warmup_llm()
