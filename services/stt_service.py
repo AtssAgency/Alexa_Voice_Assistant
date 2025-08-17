@@ -190,7 +190,7 @@ class STTService:
             payload = {
                 "svc": "STT",
                 "level": level,
-                "msg": message
+                "message": message
             }
             if event:
                 payload["event"] = event

@@ -29,6 +29,7 @@ import sounddevice as sd
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import uvicorn
 
 try:
@@ -169,7 +170,7 @@ class KWDService:
             payload = {
                 "svc": "KWD",
                 "level": level,
-                "msg": message
+                "message": message
             }
             if event:
                 payload["event"] = event
@@ -486,24 +487,23 @@ class KWDService:
 # Global KWD instance
 kwd_service = KWDService()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await kwd_service.startup()
+    yield
+    # Shutdown
+    await kwd_service.shutdown()
+
+
 # FastAPI app
 app = FastAPI(
     title="KWD Service",
     description="Wake Word Detection using openWakeWord",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan
 )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """FastAPI startup event"""
-    await kwd_service.startup()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI shutdown event"""
-    await kwd_service.shutdown()
 
 
 @app.post("/on-system-ready")

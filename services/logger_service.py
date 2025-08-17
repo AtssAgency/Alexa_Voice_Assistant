@@ -258,7 +258,7 @@ class LoggerService:
                 "svc": "LOGGER",
                 "level": "INFO",
                 "event": "service_start",
-                "msg": f"Logger service started on port {self.port}"
+                "message": f"Logger service started on port {self.port}"
             }
             self.write_app_log(startup_data)
             
@@ -312,7 +312,7 @@ async def log_event(request: LogRequest):
             "ts": timestamp if logger_service.append_timestamps else None,
             "svc": request.svc,
             "level": request.level.upper(),
-            "msg": request.message
+            "message": request.message
         }
         
         if request.event:

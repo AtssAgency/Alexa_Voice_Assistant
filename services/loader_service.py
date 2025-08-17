@@ -273,7 +273,7 @@ class LoaderService:
             payload = {
                 "svc": "LOADER",
                 "level": level,
-                "msg": message
+                "message": message
             }
             if event:
                 payload["event"] = event
@@ -389,8 +389,10 @@ class LoaderService:
             self.log_to_logger("error", f"Failed to spawn {service_name}: {e}", "service_error")
             return False
     
+    # services/loader_service.py
+
     def health_check_service(self, service_name: str) -> bool:
-        """Check if service is healthy via /health endpoint"""
+        """Check if service is healthy via /health endpoint."""
         if service_name not in self.services:
             return False
             
@@ -399,8 +401,12 @@ class LoaderService:
         # Logger is special - we assume it's ready if we can send logs to it
         if service_name == "logger":
             try:
+                # Still check the actual health endpoint for consistency
                 response = requests.get(f"{self.logger_url}/health", timeout=1.0)
-                return response.status_code == 200
+                if response.status_code == 200:
+                    data = response.json()
+                    return data.get("state") == "READY"
+                return False
             except Exception:
                 return False
         
@@ -408,11 +414,15 @@ class LoaderService:
         if service.config.health_url:
             try:
                 response = requests.get(service.config.health_url, timeout=1.0)
-                return response.status_code == 200
+                if response.status_code == 200:
+                    data = response.json()
+                    # A service is healthy if it's READY or already ACTIVE
+                    return data.get("state") in ["READY", "ACTIVE"]
+                return False
             except Exception:
                 return False
         
-        # No health URL - just check if process is alive
+        # No health URL - just check if process is alive (fallback)
         return service.process and service.process.poll() is None
     
     def wait_for_service_health(self, service_name: str) -> bool:
@@ -455,7 +465,7 @@ class LoaderService:
         self.log_to_logger("error", f"{service_name} failed health check timeout", "service_error")
         return False
     
-    def warmup_llm(self) -> bool:
+    def _perform_warmup_llm(self) -> bool:
         """Warm up LLM service if configured"""
         # Check if warmup is disabled via CLI or not configured
         if self.skip_warmup or not self.warmup_llm or "llm" not in self.services:
@@ -680,7 +690,7 @@ class LoaderService:
                     self.log_to_logger("info", "Selected services ready", "selected_services_ready")
                 
                 # Warmup LLM
-                self.warmup_llm()
+                self._perform_warmup_llm()
                 
                 # Trigger KWD greeting
                 self.trigger_kwd_greeting()

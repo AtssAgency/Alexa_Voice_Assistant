@@ -28,6 +28,7 @@ import numpy as np
 import sounddevice as sd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import uvicorn
 
 
@@ -139,7 +140,7 @@ class RMSService:
             payload = {
                 "svc": "RMS",
                 "level": level,
-                "msg": message
+                "message": message
             }
             if event:
                 payload["event"] = event
@@ -438,24 +439,23 @@ class RMSService:
 # Global RMS instance
 rms_service = RMSService()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await rms_service.startup()
+    yield
+    # Shutdown
+    await rms_service.shutdown()
+
+
 # FastAPI app
 app = FastAPI(
     title="RMS Service",
     description="Dynamic Background Noise Monitoring",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan
 )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """FastAPI startup event"""
-    await rms_service.startup()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI shutdown event"""
-    await rms_service.shutdown()
 
 
 @app.get("/current-rms", response_model=CurrentRMSResponse)

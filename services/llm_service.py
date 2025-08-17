@@ -24,9 +24,10 @@ import configparser
 import re
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import uvicorn
 
 
@@ -80,7 +81,7 @@ class LLMService:
         self.max_tokens = 512
         
         # Modelfile configuration (authoritative)
-        self.model = "llama3.1:8b-instruct-q4"
+        self.model = "llama3.1:8b-instruct-q4_K_M"
         self.system_prompt = "You are a helpful AI voice assistant. You provide concise, friendly responses to user questions. Keep your answers brief and conversational, as they will be spoken aloud. Avoid using markdown formatting or special characters in your responses."
         
         # Metrics tracking
@@ -186,7 +187,7 @@ class LLMService:
             payload = {
                 "svc": "LLM",
                 "level": level,
-                "msg": message
+                "message": message
             }
             if event:
                 payload["event"] = event
@@ -462,24 +463,23 @@ class LLMService:
 # Global LLM instance
 llm_service = LLMService()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await llm_service.startup()
+    yield
+    # Shutdown
+    await llm_service.shutdown()
+
+
 # FastAPI app
 app = FastAPI(
     title="LLM Service",
     description="Streaming Language Model Completions via Ollama",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan
 )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """FastAPI startup event"""
-    await llm_service.startup()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI shutdown event"""
-    await llm_service.shutdown()
 
 
 @app.post("/complete")

@@ -8,7 +8,7 @@ Ultra-minimal entrypoint that:
 3. Spawns Loader (process manager) which handles the rest
 4. Forwards signals and returns Loader's exit code
 
-State flow: INIT → STARTING_LOGGER → STARTING_LOADER → RUN → SHUTDOWN
+State flow: INIT → STARTING_LOADER → RUN → SHUTDOWN
 """
 
 import sys
@@ -97,7 +97,7 @@ class MainOrchestrator:
                         json={
                             "svc": "MAIN",
                             "level": "info",
-                            "msg": "service_start",
+                            "message": "service_start",
                             "event": "service_start"
                         },
                         timeout=1.0
@@ -124,7 +124,7 @@ class MainOrchestrator:
             payload = {
                 "svc": "MAIN",
                 "level": level,
-                "msg": message
+                "message": message
             }
             if event:
                 payload["event"] = event
@@ -213,11 +213,7 @@ class MainOrchestrator:
             
             # Setup signal handlers
             self.setup_signal_handlers()
-            
-            # STARTING_LOGGER: Start logger first and wait for readiness
-            #if not self.start_logger():
-            #    return 1
-            
+                    
             # STARTING_LOADER: Start loader (process manager)  
             if not self.start_loader():
                 self.shutdown()

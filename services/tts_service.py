@@ -32,6 +32,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import uvicorn
 
 # Import Kokoro TTS components
@@ -179,7 +180,7 @@ class TTSService:
             payload = {
                 "svc": "TTS",
                 "level": level,
-                "msg": message
+                "message": message
             }
             if event:
                 payload["event"] = event
@@ -649,24 +650,23 @@ class TTSService:
 # Global TTS instance
 tts_service = TTSService()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await tts_service.startup()
+    yield
+    # Shutdown
+    await tts_service.shutdown()
+
+
 # FastAPI app
 app = FastAPI(
     title="TTS Service",
     description="Streaming Text-to-Speech using Kokoro",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan
 )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """FastAPI startup event"""
-    await tts_service.startup()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI shutdown event"""
-    await tts_service.shutdown()
 
 
 @app.post("/speak")
