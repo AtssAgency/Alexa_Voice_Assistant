@@ -8,4 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
-.kiro
+
+# Folders
+docs/
+logs/
+models/
+tests/
