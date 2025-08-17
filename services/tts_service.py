@@ -111,6 +111,11 @@ class TTSService:
         self.silence_pad_ms = 60
         self.allow_llm_pull = False
         
+        # ONNX assets
+        self.model_path = "models/kokoro_onnx/kokoro-v1.0.fp16.onnx"
+        self.voices_path = "models/kokoro_onnx/voices-v1.0.bin"
+        self.quant_preference = "fp16"
+        
         # Kokoro TTS engine
         self.tts_engine: Optional[KokoroONNX] = None
         
@@ -161,6 +166,11 @@ class TTSService:
                     self.chunk_chars = tts_section.getint('chunk_chars', self.chunk_chars)
                     self.silence_pad_ms = tts_section.getint('silence_pad_ms', self.silence_pad_ms)
                     self.allow_llm_pull = tts_section.getboolean('allow_llm_pull', self.allow_llm_pull)
+                    
+                    # ONNX assets
+                    self.model_path = tts_section.get('model_path', self.model_path)
+                    self.voices_path = tts_section.get('voices_path', self.voices_path)
+                    self.quant_preference = tts_section.get('quant_preference', self.quant_preference)
                 
                 # Load dependencies section
                 if 'deps' in self.config:
@@ -177,10 +187,14 @@ class TTSService:
     def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
         try:
+            # Add human-readable timestamp (dd-mm-yy HH:MM:SS format)
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%d-%m-%y %H:%M:%S")
+            
             payload = {
                 "svc": "TTS",
                 "level": level,
-                "message": message
+                "message": message,
             }
             if event:
                 payload["event"] = event
@@ -234,18 +248,29 @@ class TTSService:
                 self.log("error", "Kokoro TTS not available")
                 return False
             
-            # Initialize Kokoro with specified voice and settings
+            # Check if model and voices files exist
+            model_path = Path(self.model_path)
+            voices_path = Path(self.voices_path)
+            
+            if not model_path.exists():
+                self.log("error", f"Model file not found: {self.model_path}")
+                return False
+            
+            if not voices_path.exists():
+                self.log("error", f"Voices file not found: {self.voices_path}")
+                return False
+            
+            # Initialize Kokoro with model and voices paths
             device = self.device if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if self.dtype == "float16" and device == "cuda" else torch.float32
             
             self.tts_engine = KokoroONNX(
+                model_path=str(model_path),
+                voices_path=str(voices_path),
                 voice=self.voice,
-                device=device,
-                dtype=dtype,
-                sample_rate=self.sample_rate
+                device=device
             )
             
-            self.log("info", f"TTS engine initialized with voice {self.voice}", "voice_loaded")
+            self.log("info", f"TTS engine initialized with voice {self.voice}, model: {self.model_path}", "model_loaded")
             return True
             
         except Exception as e:

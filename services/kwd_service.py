@@ -175,7 +175,6 @@ class KWDService:
                 "svc": "KWD",
                 "level": level,
                 "message": message,
-                "ts_ms": timestamp
             }
             if event:
                 payload["event"] = event
