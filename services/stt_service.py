@@ -30,6 +30,7 @@ import requests
 import websockets
 from fastapi import FastAPI, HTTPException, WebSocket
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import uvicorn
 
 try:
@@ -82,12 +83,12 @@ class STTService:
         self.config: Optional[configparser.ConfigParser] = None
         
         # Service URLs
-        self.logger_url = "http://*********:5000"
-        self.rms_url = "http://*********:5006"
-        self.kwd_url = "http://*********:5002"
-        self.llm_url = "http://*********:5004"
-        self.tts_ws_speak = "ws://*********:5005/speak-stream"
-        self.tts_ws_events = "ws://*********:5005/playback-events"
+        self.logger_url = "http://127.0.0.1:5000"
+        self.rms_url = "http://127.0.0.1:5006"
+        self.kwd_url = "http://127.0.0.1:5002"
+        self.llm_url = "http://127.0.0.1:5004"
+        self.tts_ws_speak = "ws://127.0.0.1:5005/speak-stream"
+        self.tts_ws_events = "ws://127.0.0.1:5005/playback-events"
         
         # Configuration
         self.port = 5003
@@ -116,7 +117,7 @@ class STTService:
         # Dialog session state
         self.active_dialog_id: Optional[str] = None
         self.dialog_thread: Optional[threading.Thread] = None
-        self.stop_dialog = threading.Event()
+        self.stop_flag = threading.Event()
         
         # Audio capture
         self.audio_stream: Optional[sd.InputStream] = None
@@ -335,7 +336,7 @@ class STTService:
             
             self.log("info", "Listening for speech...")
             
-            while not self.stop_dialog.is_set():
+            while not self.stop_flag.is_set():
                 time.sleep(chunk_duration)
                 
                 # Get audio chunk
@@ -456,7 +457,7 @@ class STTService:
             full_response = ""
             
             for line in response.iter_lines():
-                if self.stop_dialog.is_set():
+                if self.stop_flag.is_set():
                     break
                     
                 if line:
@@ -502,7 +503,7 @@ class STTService:
             
             self.log("debug", "Waiting for TTS playback completion")
             
-            while not self.stop_dialog.is_set():
+            while not self.stop_flag.is_set():
                 try:
                     # Wait for event with timeout
                     message = await asyncio.wait_for(
@@ -614,7 +615,7 @@ class STTService:
         try:
             self.active_dialog_id = dialog_id
             self.state = STTState.ACTIVE
-            self.stop_dialog.clear()
+            self.stop_flag.clear()
             
             # Start dialog worker in background
             self.dialog_thread = threading.Thread(
@@ -638,7 +639,7 @@ class STTService:
         
         try:
             self.log("info", f"Stopping dialog: {reason}")
-            self.stop_dialog.set()
+            self.stop_flag.set()
             
             # Wait for dialog thread to finish
             if self.dialog_thread and self.dialog_thread.is_alive():
@@ -682,7 +683,7 @@ class STTService:
         
         # Stop any active dialog
         if self.active_dialog_id:
-            self.stop_dialog(self.active_dialog_id, "shutdown")
+            self.stop_flag(self.active_dialog_id, "shutdown")
         
         # Stop audio capture
         self.stop_audio_capture()
@@ -691,24 +692,23 @@ class STTService:
 # Global STT instance
 stt_service = STTService()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await stt_service.startup()
+    yield
+    # Shutdown
+    await stt_service.shutdown()
+
+
 # FastAPI app
 app = FastAPI(
     title="STT Service",
     description="Speech-to-Text with Dialog Session Management",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan
 )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """FastAPI startup event"""
-    await stt_service.startup()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI shutdown event"""
-    await stt_service.shutdown()
 
 
 @app.post("/start")
@@ -740,7 +740,7 @@ async def stop_dialog(request: StopRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    status = "ok" if stt_service.state != STTState.INIT else "error"
+    status = "ok" if stt_service.state == STTState.READY else "error"
     return HealthResponse(status=status, state=stt_service.state)
 
 
@@ -754,7 +754,7 @@ def main():
     """Entry point when run as module"""
     uvicorn.run(
         app,
-        host="*********",
+        host="127.0.0.1",
         port=stt_service.port,
         log_level="error",  # Suppress uvicorn logs to keep console clean
         access_log=False

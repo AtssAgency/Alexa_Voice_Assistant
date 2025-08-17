@@ -77,8 +77,8 @@ class MainOrchestrator:
             # Spawn logger process using current interpreter
             self.logger_process = subprocess.Popen(
                 [sys.executable, "-m", "services.logger_service"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+               # stdout=subprocess.PIPE,
+               # stderr=subprocess.PIPE
             )
             
             # Wait for logger to be ready by polling /log endpoint
@@ -146,8 +146,8 @@ class MainOrchestrator:
             # Spawn loader process using current interpreter
             self.loader_process = subprocess.Popen(
                 [sys.executable, "-m", "services.loader_service"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+               # stdout=subprocess.PIPE,
+               # stderr=subprocess.PIPE
             )
             
             return True
@@ -215,8 +215,8 @@ class MainOrchestrator:
             self.setup_signal_handlers()
             
             # STARTING_LOGGER: Start logger first and wait for readiness
-            if not self.start_logger():
-                return 1
+            #if not self.start_logger():
+            #    return 1
             
             # STARTING_LOADER: Start loader (process manager)  
             if not self.start_loader():

@@ -329,7 +329,7 @@ class LoaderService:
         try:
             for proc in psutil.process_iter(['pid', 'name']):
                 try:
-                    connections = proc.connections()
+                    connections = proc.net_connections()
                     for conn in connections:
                         if conn.laddr.port == port:
                             proc.terminate()

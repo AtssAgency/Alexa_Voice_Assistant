@@ -63,8 +63,8 @@ class LLMService:
         self.config: Optional[configparser.ConfigParser] = None
         
         # Service URLs
-        self.logger_url = "http://*********:5000"
-        self.ollama_base_url = "http://*********:11434"
+        self.logger_url = "http://127.0.0.1:5000"
+        self.ollama_base_url = "http://127.0.0.1:11434"
         
         # Configuration
         self.port = 5004
@@ -555,7 +555,7 @@ def main():
     """Entry point when run as module"""
     uvicorn.run(
         app,
-        host="*********",
+        host="127.0.0.1",
         port=llm_service.port,
         log_level="error",  # Suppress uvicorn logs to keep console clean
         access_log=False

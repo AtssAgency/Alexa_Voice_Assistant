@@ -33,7 +33,7 @@ import uvicorn
 
 try:
     import openwakeword
-    from openwakeword import Model
+    from openwakeword.model import Model
 except ImportError:
     print("ERROR: openwakeword not installed. Run: pip install openwakeword")
     sys.exit(1)
@@ -80,10 +80,10 @@ class KWDService:
         self.config: Optional[configparser.ConfigParser] = None
         
         # Service URLs
-        self.logger_url = "http://*********:5000"
-        self.rms_url = "http://*********:5006"
-        self.tts_url = "http://*********:5005"
-        self.stt_url = "http://*********:5003"
+        self.logger_url = "http://127.0.0.1:5000"
+        self.rms_url = "http://127.0.0.1:5006"
+        self.tts_url = "http://127.0.0.1:5005"
+        self.stt_url = "http://127.0.0.1:5003"
         
         # Configuration
         self.port = 5002
@@ -104,10 +104,10 @@ class KWDService:
         self.chunk_size = 1280  # 80ms at 16kHz
         
         # Wake word engine
-        self.model: Optional[Model] = None
+        self.detector: Optional[Model] = None
         self.detection_thread: Optional[threading.Thread] = None
         self.audio_stream: Optional[sd.InputStream] = None
-        self.stop_detection = threading.Event()
+        self.stop_event = threading.Event()
         
         # State management
         self.current_threshold = self.base_rms_threshold
@@ -150,6 +150,14 @@ class KWDService:
                 self.quiet_factor = adaptive_section.getfloat('quiet_factor', self.quiet_factor)
                 self.noisy_factor = adaptive_section.getfloat('noisy_factor', self.noisy_factor)
             
+            # Load dependency URLs
+            if 'kwd.deps' in self.config:
+                deps_section = self.config['kwd.deps']
+                self.logger_url = deps_section.get('logger_url', self.logger_url)
+                self.tts_url = deps_section.get('tts_url', self.tts_url)
+                self.stt_url = deps_section.get('stt_url', self.stt_url)
+                self.rms_url = deps_section.get('rms_url', self.rms_url)
+            
             return True
         except Exception as e:
             self.log("error", f"Failed to load config: {e}")
@@ -176,7 +184,8 @@ class KWDService:
     def get_current_rms(self) -> Optional[float]:
         """Get current RMS noise level from RMS service"""
         try:
-            response = requests.get(f"{self.rms_url}/current-rms", timeout=2.0)
+            # rms_url from config already includes the endpoint (/current-rms)
+            response = requests.get(self.rms_url, timeout=2.0)
             if response.status_code == 200:
                 data = response.json()
                 return data.get("rms_dbfs")
@@ -215,7 +224,8 @@ class KWDService:
                 return False
             
             self.log("info", f"Loading wake word model: {self.model_path}")
-            self.model = Model(wakeword_models=[str(model_file)], inference_framework='onnx')
+            # Initialize the detector with the single ONNX model
+            self.detector = Model(wakeword_model_paths=[str(model_file)])
             
             self.log("info", "Wake word model loaded successfully", "model_loaded")
             return True
@@ -272,7 +282,7 @@ class KWDService:
         """Main detection thread worker"""
         self.log("info", "Detection worker started")
         
-        while not self.stop_detection.is_set():
+        while not self.stop_event.is_set():
             try:
                 if self.state != KWDState.ACTIVE:
                     time.sleep(0.1)
@@ -288,9 +298,9 @@ class KWDService:
                     audio_chunk = np.array(self.audio_buffer[:self.chunk_size])
                     self.audio_buffer = self.audio_buffer[self.chunk_size:]
                 
-                # Process with wake word model
-                if self.model:
-                    predictions = self.model.predict(audio_chunk)
+                # Process with wake word detector
+                if self.detector:
+                    predictions = self.detector.predict(audio_chunk)
                     
                     # Check for wake word detection
                     for model_name, score in predictions.items():
@@ -350,7 +360,8 @@ class KWDService:
             phrase = random.choice(self.yes_phrases)
             payload = TTSSpeakRequest(text=phrase, dialog_id=dialog_id)
             
-            response = requests.post(f"{self.tts_url}/speak", 
+            # tts_url from config already includes the endpoint (/speak)
+            response = requests.post(self.tts_url, 
                                    json=payload.dict(), timeout=5.0)
             
             if response.status_code == 200:
@@ -366,7 +377,8 @@ class KWDService:
         try:
             payload = STTStartRequest(dialog_id=dialog_id)
             
-            response = requests.post(f"{self.stt_url}/start", 
+            # stt_url from config already includes the endpoint (/start)
+            response = requests.post(self.stt_url, 
                                    json=payload.dict(), timeout=5.0)
             
             if response.status_code == 200:
@@ -391,7 +403,7 @@ class KWDService:
                 return False
             
             # Start detection thread
-            self.stop_detection.clear()
+            self.stop_event.clear()
             self.detection_thread = threading.Thread(target=self.detection_worker, daemon=True)
             self.detection_thread.start()
             
@@ -406,7 +418,7 @@ class KWDService:
     def stop_detection(self):
         """Stop wake word detection"""
         self.state = KWDState.SLEEP
-        self.stop_detection.set()
+        self.stop_event.set()
         
         # Stop audio stream
         self.stop_audio_stream()
@@ -422,7 +434,8 @@ class KWDService:
         try:
             # Send greeting to TTS
             payload = TTSSpeakRequest(text=self.greeting_text)
-            response = requests.post(f"{self.tts_url}/speak", 
+            # tts_url from config already includes the endpoint (/speak)
+            response = requests.post(self.tts_url, 
                                    json=payload.dict(), timeout=10.0)
             
             if response.status_code == 200:
@@ -546,7 +559,7 @@ def main():
     """Entry point when run as module"""
     uvicorn.run(
         app,
-        host="*********",
+        host="127.0.0.1",
         port=kwd_service.port,
         log_level="error",  # Suppress uvicorn logs to keep console clean
         access_log=False
