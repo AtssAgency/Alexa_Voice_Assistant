@@ -331,12 +331,21 @@ class TTSService:
             
             start_time = time.time()
             
-            # Generate audio using Kokoro
-            audio_data = self.tts_engine(text, voice=self.voice)
+            # Generate audio using Kokoro - use create() method
+            audio_data, sample_rate = self.tts_engine.create(text, voice=self.voice)
+            
+            # Update sample rate if different from config
+            if sample_rate != self.sample_rate:
+                self.log("info", f"Using Kokoro sample rate: {sample_rate} Hz")
+                self.sample_rate = sample_rate
             
             # Convert to numpy array if needed
             if isinstance(audio_data, torch.Tensor):
                 audio_data = audio_data.cpu().numpy()
+            
+            # Ensure float32 for sounddevice
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
             
             synth_time = (time.time() - start_time) * 1000
             self.send_metric("chunk_synth_ms", synth_time)
@@ -421,16 +430,17 @@ class TTSService:
             if not self.is_playing:
                 self.is_playing = True
                 self.playback_start_time = time.time()
-                asyncio.create_task(self.emit_playback_event("playback_started", dialog_id))
+                # Skip event emission from background thread to avoid asyncio issues
+                self.log("debug", f"Playback started for dialog {dialog_id}")
             
             # Play audio using sounddevice
             sd.play(audio_data, samplerate=self.sample_rate, device=self.audio_device)
             sd.wait()  # Wait until audio is finished
             
-            # Emit progress event
+            # Log progress instead of emitting events from background thread
             if self.playback_start_time:
                 elapsed_ms = (time.time() - self.playback_start_time) * 1000
-                asyncio.create_task(self.emit_playback_event("progress", dialog_id, elapsed_ms))
+                self.log("debug", f"Audio playback progress: {elapsed_ms:.0f}ms")
             
         except Exception as e:
             self.log("error", f"Audio playback error: {e}")

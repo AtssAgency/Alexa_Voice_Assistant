@@ -1,44 +1,25 @@
 [project]
-name = "alexa-new"
+name = "alexa-fast"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi==0.115.6",
-    "faster-whisper>=1.2.0",
-    "grpcio>=1.74.0",
-    "grpcio-health-checking>=1.74.0",
-    "grpcio-testing>=1.74.0",
-    "grpcio-tools>=1.74.0",
-    "httpx>=0.28.1",
-    "kokoro>=0.9.4",
-    "kokoro-onnx>=0.3.9",
-    "kokoro-tts>=2.2.1",
-    "misaki>=0.9.4",
+    "faster-whisper==1.2.0",
+    "httpx==0.28.1",
+    "kokoro-onnx==0.3.9",
     "numpy==2.2.6",
-    "ollama>=0.5.3",
-    "onnxruntime==1.22.1",
-    "onnxruntime-gpu>=1.22.0",
-    "openai-whisper>=20250625",
+    "onnxruntime-gpu==1.22.0",
     "openwakeword==0.4.0",
-    "orjson>=3.11.2",
-    "protobuf>=6.32.0",
+    "orjson==3.11.2",
     "psutil==7.0.0",
-    "pyaudio>=0.2.14",
-    "pydantic>=2.11.7",
+    "pydantic==2.11.7",
     "pytest>=8.4.1",
     "requests==2.32.3",
-    "scipy>=1.16.1",
     "sounddevice==0.5.2",
-    "soundfile>=0.13.1",
+    "soundfile==0.13.1",
     "torch>=2.8.0",
-    "torchaudio>=2.8.0",
-    "torchvision>=0.23.0",
-    "uvicorn[standard]==0.34.0",
-    "webrtcvad>=2.0.10",
-    "websockets>=15.0.1",
+    "uvicorn==0.34.0",
+    "websockets==15.0.1",
 ]
-
-[tool.uv.sources]
-kokoro = { git = "https://github.com/hexgrad/kokoro" }

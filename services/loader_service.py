@@ -355,19 +355,13 @@ class LoaderService:
             self.kill_stale_processes_on_port(config.port)
         
         try:
-            # Create log directory for service stdout/stderr
-            logs_dir = Path("logs")
-            logs_dir.mkdir(exist_ok=True)
-            
-            stdout_file = logs_dir / f"{service_name}_stdout.log"
-            stderr_file = logs_dir / f"{service_name}_stderr.log"
-            
-            # Spawn process
+            # Spawn process without individual stdout/stderr logging
+            # Services should log through the centralized Logger service
             start_time = time.time()
             process = subprocess.Popen(
                 config.cmd.split(),
-                stdout=open(stdout_file, 'w'),
-                stderr=open(stderr_file, 'w'),
+                stdout=subprocess.DEVNULL,  # Discard stdout - services use Logger service
+                stderr=subprocess.DEVNULL,  # Discard stderr - services use Logger service  
                 preexec_fn=os.setsid  # Create new process group
             )
             
