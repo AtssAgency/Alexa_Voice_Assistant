@@ -20,12 +20,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-import configparser
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import uvicorn
+from .config_loader import app_config
+from .shared import lifespan_with_httpx
 
 
 # Request/Response Models
@@ -78,7 +79,9 @@ class HealthResponse(BaseModel):
 class LoggerService:
     def __init__(self):
         self.state = "INIT"
-        self.config: Optional[configparser.ConfigParser] = None
+        
+        # Load configuration from config_loader
+        logger_config = app_config.logger
         
         # File handles
         self.app_log_file = None
@@ -87,10 +90,10 @@ class LoggerService:
         self.dialog_files: Dict[str, Any] = {}
         
         # Configuration
-        self.log_level = "info"
-        self.dialog_prefix = "dialog_"
-        self.append_timestamps = True
-        self.port = 5000
+        self.log_level = logger_config.log_level
+        self.dialog_prefix = logger_config.dialog_prefix
+        self.append_timestamps = logger_config.append_timestamps
+        self.port = logger_config.port
         
         # Valid service names
         self.valid_services = {"MAIN", "LOADER", "KWD", "STT", "LLM", "TTS", "RMS", "LOGGER"}
@@ -104,29 +107,6 @@ class LoggerService:
             "llm_stream_end"
         }
     
-    def load_config(self) -> bool:
-        """Load configuration from config/config.ini"""
-        try:
-            config_path = Path("config/config.ini")
-            if not config_path.exists():
-                print("WARNING: config/config.ini not found, using defaults")
-                return True
-                
-            self.config = configparser.ConfigParser()
-            self.config.read(config_path)
-            
-            # Load logger section
-            if 'logger' in self.config:
-                logger_section = self.config['logger']
-                self.log_level = logger_section.get('log_level', 'info').lower()
-                self.dialog_prefix = logger_section.get('dialog_prefix', 'dialog_')
-                self.append_timestamps = logger_section.getboolean('append_timestamps', True)
-                self.port = logger_section.getint('port', 5000)
-            
-            return True
-        except Exception as e:
-            print(f"ERROR: Failed to load config: {e}")
-            return False
     
     def setup_log_files(self) -> bool:
         """Create logs directory and open log files"""
@@ -240,15 +220,10 @@ class LoggerService:
     async def startup(self):
         """Service startup logic"""
         try:
-            # Load configuration
-            if not self.load_config():
-                self.state = "ERROR"
-                return
-                
             # Setup log files
             if not self.setup_log_files():
                 self.state = "ERROR"
-                return
+                return False
                 
             self.state = "READY"
             
@@ -266,9 +241,12 @@ class LoggerService:
             console_msg = self.format_console_message("LOGGER", "INFO", f"Logger service started on port {self.port}")
             print(console_msg)
             
+            return True
+            
         except Exception as e:
             print(f"FATAL: Logger startup failed: {e}")
             self.state = "ERROR"
+            return False
 
 
 # Global logger instance
@@ -276,10 +254,12 @@ logger_service = LoggerService()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def service_lifespan():
     """Application lifespan manager"""
     # Startup
-    await logger_service.startup()
+    success = await logger_service.startup()
+    if not success:
+        raise RuntimeError("Logger service startup failed")
     yield
     # Shutdown
     logger_service.cleanup()
@@ -290,7 +270,7 @@ app = FastAPI(
     title="Logger Service",
     description="Central logging, metrics aggregation, and dialog transcripts",
     version="1.0",
-    lifespan=lifespan
+    lifespan=lambda app: lifespan_with_httpx(service_lifespan)
 )
 
 

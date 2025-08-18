@@ -18,8 +18,8 @@ import signal
 import subprocess
 import time
 import psutil
-import requests
 import configparser
+import asyncio
 import random
 import argparse
 from datetime import datetime, timedelta
@@ -27,6 +27,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass
 from enum import Enum
+
+# Import config_loader when running as a service module
+try:
+    from .config_loader import app_config
+    HAVE_CONFIG_LOADER = True
+except ImportError:
+    # When running standalone, config_loader is not available
+    HAVE_CONFIG_LOADER = False
+    app_config = None
 
 
 class LoaderState(Enum):
@@ -64,20 +73,38 @@ class ServiceProcess:
 class LoaderService:
     def __init__(self):
         self.state = LoaderState.INIT
-        self.config: Optional[configparser.ConfigParser] = None
-        self.logger_url = "http://127.0.0.1:5000"
         
-        # Configuration
-        self.startup_order = []
-        self.health_timeout_s = 30
-        self.health_interval_ms = 200
-        self.restart_backoff_ms = [250, 500, 1000, 2000]
-        self.crash_loop_threshold = 3
-        self.port_hygiene = True
-        self.vram_probe_cmd = "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits"
-        self.warmup_llm = True
-        self.greeting_on_ready = True
-        self.python = sys.executable
+        # Try to use config_loader if available, otherwise use defaults
+        if HAVE_CONFIG_LOADER and app_config:
+            loader_config = app_config.loader
+            paths_config = app_config.paths
+            deps_config = app_config.deps
+            
+            # Configuration from config_loader
+            self.logger_url = deps_config.logger_url
+            self.startup_order = loader_config.startup_order
+            self.health_timeout_s = loader_config.health_timeout_s
+            self.health_interval_ms = loader_config.health_interval_ms
+            self.restart_backoff_ms = loader_config.restart_backoff_ms
+            self.crash_loop_threshold = loader_config.crash_loop_threshold
+            self.port_hygiene = loader_config.port_hygiene
+            self.vram_probe_cmd = loader_config.vram_probe_cmd
+            self.warmup_llm = loader_config.warmup_llm
+            self.greeting_on_ready = loader_config.greeting_on_ready
+            self.python = paths_config.python if paths_config.python else sys.executable
+        else:
+            # Fallback defaults when config_loader is not available
+            self.logger_url = "http://127.0.0.1:5000"
+            self.startup_order = []
+            self.health_timeout_s = 30
+            self.health_interval_ms = 200
+            self.restart_backoff_ms = [250, 500, 1000, 2000]
+            self.crash_loop_threshold = 3
+            self.port_hygiene = True
+            self.vram_probe_cmd = "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits"
+            self.warmup_llm = True
+            self.greeting_on_ready = True
+            self.python = sys.executable
         
         # Service management
         self.services: Dict[str, ServiceProcess] = {}
@@ -280,6 +307,7 @@ class LoaderService:
             if extra:
                 payload["extra"] = extra
                 
+            import requests
             requests.post(f"{self.logger_url}/log", json=payload, timeout=2.0)
         except Exception:
             # Fallback to stdout if logger unavailable
@@ -296,6 +324,7 @@ class LoaderService:
             if dialog_id:
                 payload["dialog_id"] = dialog_id
                 
+            import requests
             requests.post(f"{self.logger_url}/metrics", json=payload, timeout=2.0)
         except Exception:
             pass
@@ -316,6 +345,7 @@ class LoaderService:
                     "vram_mb": vram_mb,
                     "note": note
                 }
+                import requests
                 requests.post(f"{self.logger_url}/vram", json=payload, timeout=2.0)
         except Exception:
             # VRAM probing is optional
@@ -396,6 +426,7 @@ class LoaderService:
         if service_name == "logger":
             try:
                 # Still check the actual health endpoint for consistency
+                import requests
                 response = requests.get(f"{self.logger_url}/health", timeout=1.0)
                 if response.status_code == 200:
                     data = response.json()
@@ -407,6 +438,7 @@ class LoaderService:
         # Regular health check for other services
         if service.config.health_url:
             try:
+                import requests
                 response = requests.get(service.config.health_url, timeout=1.0)
                 if response.status_code == 200:
                     data = response.json()
@@ -475,6 +507,7 @@ class LoaderService:
             
         try:
             self.log_to_logger("info", "Warming up LLM service")
+            import requests
             response = requests.post(llm_config.warmup_url, timeout=30.0)
             
             if response.status_code == 200:
@@ -500,6 +533,7 @@ class LoaderService:
             
         try:
             kwd_url = "http://127.0.0.1:5002/on-system-ready"
+            import requests
             response = requests.post(kwd_url, timeout=5.0)
             
             if response.status_code == 200:

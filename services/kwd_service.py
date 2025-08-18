@@ -27,16 +27,17 @@ import time
 import threading
 import random
 import uuid
+import asyncio
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 import numpy as np
 import sounddevice as sd
-import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 from .config_loader import app_config
+from .shared import lifespan_with_httpx, safe_post, safe_get
 
 # --- Third-party wake word model ---
 try:
@@ -218,30 +219,28 @@ class KWDService:
     # Logging
     # -----------------------------
 
-    def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
+    async def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send structured log to Logger or fallback to stdout."""
-        try:
-            payload = {"svc": "KWD", "level": level, "message": message}
-            if event:
-                payload["event"] = event
-            if extra:
-                payload["extra"] = extra
-            requests.post(self._url_logger(), json=payload, timeout=1.5)
-        except Exception:
-            print(f"KWD       {level.upper():<6}= {message}")
+        payload = {"svc": "KWD", "level": level, "message": message}
+        if event:
+            payload["event"] = event
+        if extra:
+            payload["extra"] = extra
+        
+        fallback_msg = f"KWD       {level.upper():<6}= {message}"
+        await safe_post(self._url_logger(), json=payload, timeout=1.5, fallback_msg=fallback_msg)
 
     # -----------------------------
     # RMS → Adaptive threshold
     # -----------------------------
-    def get_current_rms_dbfs(self) -> Optional[float]:
+    async def get_current_rms_dbfs(self) -> Optional[float]:
         """Query RMS service (optional)."""
         try:
-            r = requests.get(self._url_rms(), timeout=1.0)
-            if r.status_code == 200:
-                data = r.json()
+            data = await safe_get(self._url_rms(), timeout=1.0)
+            if data:
                 return data.get("rms_dbfs")
         except Exception as e:
-            self.log("debug", f"RMS query failed: {e}")
+            await self.log("debug", f"RMS query failed: {e}")
         return None
 
     def _interp_factor(self, noise_dbfs: float) -> float:
@@ -252,15 +251,15 @@ class KWDService:
         ratio = (noise_dbfs - self.quiet_dbfs) / (self.noisy_dbfs - self.quiet_dbfs)
         return self.quiet_factor + ratio * (self.noisy_factor - self.quiet_factor)
 
-    def update_threshold_from_rms(self):
+    async def update_threshold_from_rms(self):
         """Recalculate detector threshold from ambient noise."""
-        rms_dbfs = self.get_current_rms_dbfs()
+        rms_dbfs = await self.get_current_rms_dbfs()
         if rms_dbfs is None:
             return
         new_thr = self.base_threshold * self._interp_factor(rms_dbfs)
         if abs(new_thr - self.current_threshold) >= 0.01:
             self.current_threshold = float(np.clip(new_thr, 0.05, 0.99))
-            self.log(
+            await self.log(
                 "debug",
                 f"Adaptive threshold → {self.current_threshold:.3f} (RMS {rms_dbfs:.1f} dBFS)",
             )
@@ -268,19 +267,19 @@ class KWDService:
     # -----------------------------
     # Model / Audio
     # -----------------------------
-    def load_wake_word_model(self) -> bool:
+    async def load_wake_word_model(self) -> bool:
         try:
             model_file = Path(self.model_path)
             if not model_file.exists():
-                self.log("error", f"Wake word model not found: {self.model_path}")
+                await self.log("error", f"Wake word model not found: {self.model_path}")
                 return False
 
-            self.log("info", f"Loading wake word model: {self.model_path}")
+            await self.log("info", f"Loading wake word model: {self.model_path}")
             self.detector = Model(wakeword_model_paths=[str(model_file)])
-            self.log("info", "Wake word model loaded", "model_loaded")
+            await self.log("info", "Wake word model loaded", "model_loaded")
             return True
         except Exception as e:
-            self.log("error", f"Model load failed: {e}")
+            await self.log("error", f"Model load failed: {e}")
             return False
 
     def _dc_block(self, x: np.ndarray) -> np.ndarray:
@@ -305,7 +304,8 @@ class KWDService:
     def audio_callback(self, indata, frames, time_info, status):
         """Audio capture callback → accumulate int16 samples."""
         if status:
-            self.log("warning", f"Audio callback status: {status}")
+            # Can't await in audio callback, use sync fallback
+            print(f"KWD       WARNING= Audio callback status: {status}")
 
         pcm = indata
         if pcm.ndim == 2:
@@ -325,7 +325,7 @@ class KWDService:
             if len(self.audio_buffer) > max_len:
                 self.audio_buffer = self.audio_buffer[-max_len:]
 
-    def start_audio_stream(self) -> bool:
+    async def start_audio_stream(self) -> bool:
         """Open sounddevice.InputStream with desired device/index."""
         try:
             self.audio_stream = sd.InputStream(
@@ -337,22 +337,22 @@ class KWDService:
                 blocksize=self.chunk_size,  # 80 ms chunks
             )
             self.audio_stream.start()
-            self.log("info", f"Audio stream started (device={self.audio_device}, fs={self.sample_rate})")
+            await self.log("info", f"Audio stream started (device={self.audio_device}, fs={self.sample_rate})")
             return True
         except Exception as e:
-            self.log("error", f"Failed to start audio stream: {e}")
+            await self.log("error", f"Failed to start audio stream: {e}")
             return False
 
-    def stop_audio_stream(self):
+    async def stop_audio_stream(self):
         if self.audio_stream:
             try:
                 self.audio_stream.stop()
                 self.audio_stream.close()
             except Exception as e:
-                self.log("warning", f"Error stopping audio stream: {e}")
+                await self.log("warning", f"Error stopping audio stream: {e}")
             finally:
                 self.audio_stream = None
-                self.log("info", "Audio stream stopped")
+                await self.log("info", "Audio stream stopped")
 
     # -----------------------------
     # Silence wait for re-arm
@@ -389,7 +389,8 @@ class KWDService:
     # Detection Loop
     # -----------------------------
     def detection_worker(self):
-        self.log("info", "Detection worker started")
+        # Use sync fallback logging in worker thread
+        print("KWD       INFO  = Detection worker started")
         while not self.stop_event.is_set():
             try:
                 if self.state != KWDState.ACTIVE:
@@ -442,14 +443,21 @@ class KWDService:
 
                 # Adaptive threshold every ~5s
                 if now - self._last_thr_update > self._thr_update_interval_s:
-                    self.update_threshold_from_rms()
+                    # Run async method from thread using asyncio bridge
+                    try:
+                        loop = asyncio.get_event_loop()
+                        asyncio.run_coroutine_threadsafe(
+                            self.update_threshold_from_rms(), loop
+                        )
+                    except:
+                        pass  # Skip if no event loop available
                     self._last_thr_update = now
 
             except Exception as e:
-                self.log("error", f"Detection worker error: {e}")
+                print(f"KWD       ERROR = Detection worker error: {e}")
                 time.sleep(0.05)
 
-        self.log("info", "Detection worker stopped")
+        print("KWD       INFO  = Detection worker stopped")
 
     def handle_wake_detection(self, confidence: float):
         # one-shot guard to prevent parallel side-effects
@@ -472,12 +480,19 @@ class KWDService:
             self.debounce_until = now + (self.debounce_after_tts_ms / 1000.0)
 
         self.state = KWDState.TRIGGERED
-        self.log(
-            "info",
-            f"Wake word detected (score={confidence:.3f}, thr={self.current_threshold:.3f})",
-            "wake_detected",
-            {"score": confidence, "threshold": self.current_threshold},
-        )
+        # Use asyncio bridge for logging from this thread
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                self.log(
+                    "info",
+                    f"Wake word detected (score={confidence:.3f}, thr={self.current_threshold:.3f})",
+                    "wake_detected",
+                    {"score": confidence, "threshold": self.current_threshold},
+                ), loop
+            )
+        except:
+            print(f"KWD       INFO  = Wake word detected (score={confidence:.3f}, thr={self.current_threshold:.3f})")
 
         dialog_id = f"dialog_{uuid.uuid4().hex[:8]}"
 
@@ -506,16 +521,16 @@ class KWDService:
             )
 
             if not got_silence:
-                self.log("debug", "Re-arm without silence (timeout reached)")
+                print("KWD       DEBUG = Re-arm without silence (timeout reached)")
 
             # Re-arm
             self.state = KWDState.ACTIVE
             self.in_progress = False
-            self.log("debug", "Cooldown + silence satisfied → ACTIVE")
+            print("KWD       DEBUG = Cooldown + silence satisfied → ACTIVE")
         except Exception as e:
             self.in_progress = False
             self.state = KWDState.ACTIVE
-            self.log("warning", f"Re-arm workflow error: {e}")
+            print(f"KWD       WARNING= Re-arm workflow error: {e}")
 
     # -----------------------------
     # Side Effects: TTS / STT
@@ -525,89 +540,111 @@ class KWDService:
         url = self._url_tts()
         try:
             payload = TTSSpeakRequest(text=phrase, dialog_id=dialog_id).dict()
-            r = requests.post(url, json=payload, timeout=8.0)
-            if r.status_code == 200:
-                self.log("debug", f"TTS confirmation sent: {phrase}", "tts_called", {"url": url})
-            else:
-                self.log("warning", f"TTS confirmation failed: {r.status_code}", extra={"url": url, "body": r.text})
+            # Use asyncio bridge for HTTP call from thread
+            try:
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    safe_post(url, json=payload, timeout=8.0, 
+                             fallback_msg=f"KWD       DEBUG = TTS confirmation sent: {phrase}"), 
+                    loop
+                )
+            except:
+                print(f"KWD       DEBUG = TTS confirmation sent: {phrase}")
         except Exception as e:
-            self.log("warning", f"TTS confirmation error: {e}", extra={"url": url})
+            print(f"KWD       WARNING= TTS confirmation error: {e}")
 
     def trigger_stt_dialog(self, dialog_id: str):
         url = self._url_stt()
         try:
             payload = STTStartRequest(dialog_id=dialog_id).dict()
-            r = requests.post(url, json=payload, timeout=8.0)
-            if r.status_code == 200:
-                self.log("info", f"STT dialog started: {dialog_id}", "stt_started", {"url": url})
-            else:
-                self.log("warning", f"STT start failed: {r.status_code}", extra={"url": url, "body": r.text})
+            # Use asyncio bridge for HTTP call from thread
+            try:
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    safe_post(url, json=payload, timeout=8.0,
+                             fallback_msg=f"KWD       INFO  = STT dialog started: {dialog_id}"),
+                    loop
+                )
+            except:
+                print(f"KWD       INFO  = STT dialog started: {dialog_id}")
         except Exception as e:
-            self.log("warning", f"STT start error: {e}", extra={"url": url})
+            print(f"KWD       WARNING= STT start error: {e}")
 
     # -----------------------------
     # Start/Stop
     # -----------------------------
-    def start_detection(self) -> bool:
+    async def start_detection(self) -> bool:
         if self.state == KWDState.INIT:
             return False
         if self.detection_thread and self.detection_thread.is_alive():
             return True
 
-        if not self.start_audio_stream():
+        if not await self.start_audio_stream():
             return False
 
         self.stop_event.clear()
         self.detection_thread = threading.Thread(target=self.detection_worker, daemon=True)
         self.detection_thread.start()
         self.state = KWDState.ACTIVE
-        self.log("info", "Wake word detection started", "kwd_started")
+        await self.log("info", "Wake word detection started", "kwd_started")
         return True
 
-    def stop_detection(self):
+    async def stop_detection(self):
         self.state = KWDState.SLEEP
         self.stop_event.set()
-        self.stop_audio_stream()
+        await self.stop_audio_stream()
         if self.detection_thread and self.detection_thread.is_alive():
             self.detection_thread.join(timeout=1.5)
         self.in_progress = False
-        self.log("info", "Wake word detection stopped", "kwd_stopped")
+        await self.log("info", "Wake word detection stopped", "kwd_stopped")
 
     def play_greeting_and_activate(self):
         """Say greeting, then arm detection (even if TTS fails)."""
         url = self._url_tts()
         try:
             payload = TTSSpeakRequest(text=self.greeting_text).dict()
-            r = requests.post(url, json=payload, timeout=8.0)
-            if r.status_code == 200:
-                self.log("info", f"Greeting played: '{self.greeting_text}'", "greeting_played", {"url": url})
+            # Use asyncio bridge for HTTP call from thread
+            try:
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    safe_post(url, json=payload, timeout=8.0,
+                             fallback_msg=f"KWD       INFO  = Greeting played: '{self.greeting_text}'"),
+                    loop
+                )
                 time.sleep(0.5)
-            else:
-                self.log("warning", f"Greeting TTS failed: {r.status_code}", extra={"url": url, "body": r.text})
+            except:
+                print(f"KWD       INFO  = Greeting played: '{self.greeting_text}'")
         except Exception as e:
-            self.log("warning", f"Greeting error: {e}", extra={"url": url})
+            print(f"KWD       WARNING= Greeting error: {e}")
         finally:
-            self.start_detection()
+            # Start detection using asyncio bridge
+            try:
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    self.start_detection(), loop
+                )
+            except:
+                pass  # Skip if no event loop available
 
     # -----------------------------
     # Lifecycle
     # -----------------------------
     async def startup(self) -> bool:
         try:
-            self.log("info", "KWD service starting", "service_start")
-            if not self.load_wake_word_model():
-                self.log("error", "Wake word model load failed")
+            await self.log("info", "KWD service starting", "service_start")
+            if not await self.load_wake_word_model():
+                await self.log("error", "Wake word model load failed")
                 return False
             self.state = KWDState.READY
-            self.log("info", "KWD service ready", "service_ready")
+            await self.log("info", "KWD service ready", "service_ready")
             return True
         except Exception as e:
-            self.log("error", f"KWD startup failed: {e}")
+            await self.log("error", f"KWD startup failed: {e}")
             return False
 
     async def shutdown(self):
-        self.log("info", "KWD service shutting down")
-        self.stop_detection()
+        await self.log("info", "KWD service shutting down")
+        await self.stop_detection()
 
     # -----------------------------
     # Diagnostics
@@ -628,7 +665,8 @@ class KWDService:
                         }
                     )
         except Exception as e:
-            self.log("warning", f"Device query failed: {e}")
+            # Use sync fallback in device query
+            print(f"KWD       WARNING= Device query failed: {e}")
         return out
 
 
@@ -639,8 +677,10 @@ kwd_service = KWDService()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    await kwd_service.startup()
+async def service_lifespan():
+    success = await kwd_service.startup()
+    if not success:
+        raise RuntimeError("KWD service startup failed")
     yield
     await kwd_service.shutdown()
 
@@ -652,7 +692,7 @@ app = FastAPI(
     title="KWD Service",
     description="Wake Word Detection using openWakeWord",
     version="1.3",
-    lifespan=lifespan,
+    lifespan=lambda app: lifespan_with_httpx(service_lifespan),
 )
 
 
@@ -661,7 +701,7 @@ async def on_system_ready():
     """Called by loader after all services are READY."""
     if kwd_service.state not in (KWDState.READY, KWDState.SLEEP):
         raise HTTPException(status_code=400, detail=f"Service not ready (state={kwd_service.state})")
-    kwd_service.log("info", "System ready received", "system_ready")
+    await kwd_service.log("info", "System ready received", "system_ready")
     threading.Thread(target=kwd_service.play_greeting_and_activate, daemon=True).start()
     return {"status": "ok", "message": "Greeting + activation started"}
 
@@ -670,16 +710,16 @@ async def start_detection(_req: StartRequest = StartRequest()):
     """Arm or re-arm detection."""
     if kwd_service.state == KWDState.INIT:
         raise HTTPException(status_code=400, detail="Service not initialized")
-    if kwd_service.start_detection():
-        kwd_service.log("info", "Detection armed", "rearmed")
+    if await kwd_service.start_detection():
+        await kwd_service.log("info", "Detection armed", "rearmed")
         return {"status": "ok", "state": kwd_service.state}
     raise HTTPException(status_code=500, detail="Failed to start detection")
 
 @app.post("/stop")
 async def stop_detection_endpoint(req: StopRequest = StopRequest()):
     """Stop detection (sleep)."""
-    kwd_service.stop_detection()
-    kwd_service.log("info", f"Detection stopped: {req.reason or 'manual'}", "kwd_stopped")
+    await kwd_service.stop_detection()
+    await kwd_service.log("info", f"Detection stopped: {req.reason or 'manual'}", "kwd_stopped")
     return {"status": "ok", "state": kwd_service.state}
 
 @app.get("/health")

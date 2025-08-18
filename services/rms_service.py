@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from collections import deque
 
-import requests
 import numpy as np
 import sounddevice as sd
 from fastapi import FastAPI, HTTPException
@@ -30,6 +29,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 from .config_loader import app_config
+from .shared import lifespan_with_httpx, safe_post, safe_get
 
 
 class RMSState:
@@ -104,39 +104,29 @@ class RMSService:
         frames_per_window = int(self.window_sec * 1000 / self.frame_ms)
         self.ring_buffer_max_size = frames_per_window
     
-    def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
+    async def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
-        try:
-            # Add human-readable timestamp (dd-mm-yy HH:MM:SS format)
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%d-%m-%y %H:%M:%S")
+        payload = {
+            "svc": "RMS",
+            "level": level,
+            "message": message,
+        }
+        if event:
+            payload["event"] = event
+        if extra:
+            payload["extra"] = extra
             
-            payload = {
-                "svc": "RMS",
-                "level": level,
-                "message": message,
-            }
-            if event:
-                payload["event"] = event
-            if extra:
-                payload["extra"] = extra
-                
-            requests.post(f"{self.logger_url}/log", json=payload, timeout=2.0)
-        except Exception:
-            # Fallback to stdout if logger unavailable
-            print(f"RMS       {level.upper():<6}= {message}")
+        fallback_msg = f"RMS       {level.upper():<6}= {message}"
+        await safe_post(f"{self.logger_url}/log", json=payload, timeout=2.0, fallback_msg=fallback_msg)
     
-    def send_metric(self, metric: str, value: float):
+    async def send_metric(self, metric: str, value: float):
         """Send metric to Logger service"""
-        try:
-            payload = {
-                "svc": "RMS",
-                "metric": metric,
-                "value": value
-            }
-            requests.post(f"{self.logger_url}/metrics", json=payload, timeout=2.0)
-        except Exception:
-            pass
+        payload = {
+            "svc": "RMS",
+            "metric": metric,
+            "value": value
+        }
+        await safe_post(f"{self.logger_url}/metrics", json=payload, timeout=2.0, fallback_msg="")
     
     def initialize_audio_device(self) -> bool:
         """Initialize audio input device"""
@@ -160,7 +150,8 @@ class RMSService:
                             break
                 
                 if device_id is None:
-                    self.log("warning", f"Device '{self.device}' not found, using default")
+                    # Use sync fallback for device warning
+                    print(f"RMS       WARNING= Device '{self.device}' not found, using default")
                     device_id = sd.default.device[0]
             
             self.audio_device = device_id
@@ -168,14 +159,15 @@ class RMSService:
             
             # Validate device supports required sample rate
             if device_info['max_input_channels'] == 0:
-                self.log("error", "Selected device has no input channels")
+                print("RMS       ERROR = Selected device has no input channels")
                 return False
             
-            self.log("info", f"Audio device initialized: {device_info['name']}", "audio_initialized")
+            # Use sync fallback for device initialization logging
+            print(f"RMS       INFO  = Audio device initialized: {device_info['name']}")
             return True
             
         except Exception as e:
-            self.log("error", f"Failed to initialize audio device: {e}")
+            print(f"RMS       ERROR = Failed to initialize audio device: {e}")
             return False
     
     def calculate_rms_dbfs(self, audio_data: np.ndarray) -> float:
@@ -199,7 +191,7 @@ class RMSService:
             return max(-100.0, min(0.0, dbfs))
             
         except Exception as e:
-            self.log("error", f"RMS calculation error: {e}")
+            print(f"RMS       ERROR = RMS calculation error: {e}")
             return -100.0
     
     def calculate_noise_floor(self) -> float:
@@ -243,7 +235,8 @@ class RMSService:
     def audio_callback(self, indata, frames, time_info, status):
         """Audio input callback"""
         if status:
-            self.log("warning", f"Audio callback status: {status}")
+            # Use sync fallback in audio callback
+            print(f"RMS       WARNING= Audio callback status: {status}")
         
         try:
             # Take first channel if multichannel
@@ -259,7 +252,8 @@ class RMSService:
             self.update_metrics(dbfs)
             
         except Exception as e:
-            self.log("error", f"Audio callback error: {e}")
+            # Use sync fallback in audio callback
+            print(f"RMS       ERROR = Audio callback error: {e}")
     
     def sampler_worker(self):
         """Background sampler thread"""
@@ -276,7 +270,8 @@ class RMSService:
                 )
                 
                 with stream:
-                    self.log("info", "Audio sampler started", "sampler_started")
+                    # Use sync fallback in sampler thread
+                    print("RMS       INFO  = Audio sampler started")
                     self.retry_count = 0
                     
                     # Keep running while stream is active
@@ -284,10 +279,10 @@ class RMSService:
                         time.sleep(0.1)
                 
                 if self.running:
-                    self.log("warning", "Audio stream ended unexpectedly")
+                    print("RMS       WARNING= Audio stream ended unexpectedly")
                     
             except Exception as e:
-                self.log("error", f"Sampler error: {e}", "sampler_error")
+                print(f"RMS       ERROR = Sampler error: {e}")
                 
                 if self.running:
                     # Set error state
@@ -297,7 +292,7 @@ class RMSService:
                     self.retry_count += 1
                     if self.retry_count <= self.max_retries:
                         backoff_time = self.retry_backoff_base * (2 ** (self.retry_count - 1))
-                        self.log("info", f"Retrying in {backoff_time}s (attempt {self.retry_count})")
+                        print(f"RMS       INFO  = Retrying in {backoff_time}s (attempt {self.retry_count})")
                         
                         time.sleep(backoff_time)
                         
@@ -305,7 +300,7 @@ class RMSService:
                         if self.initialize_audio_device():
                             self.state = RMSState.READY
                     else:
-                        self.log("error", "Max retries exceeded, staying in error state")
+                        print("RMS       ERROR = Max retries exceeded, staying in error state")
                         break
     
     def stats_worker(self):
@@ -321,17 +316,31 @@ class RMSService:
                         rms_dbfs = self.ema_dbfs
                         noise_floor = self.noise_floor_db
                     
-                    # Send metrics to logger
-                    self.send_metric("rms_dbfs", rms_dbfs)
-                    self.send_metric("noise_floor_db", noise_floor)
-                    
-                    # Log snapshot
-                    self.log("debug", f"RMS snapshot: {rms_dbfs:.1f} dBFS, floor: {noise_floor:.1f} dB", "rms_snapshot")
+                    # Use asyncio bridge for metrics and logging from thread
+                    try:
+                        import asyncio
+                        loop = asyncio.get_event_loop()
+                        # Send metrics using async bridge
+                        asyncio.run_coroutine_threadsafe(
+                            self.send_metric("rms_dbfs", rms_dbfs),
+                            loop
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            self.send_metric("noise_floor_db", noise_floor),
+                            loop
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            self.log("debug", f"RMS snapshot: {rms_dbfs:.1f} dBFS, floor: {noise_floor:.1f} dB", "rms_snapshot"),
+                            loop
+                        )
+                    except:
+                        # Fallback to sync logging
+                        print(f"RMS       DEBUG = RMS snapshot: {rms_dbfs:.1f} dBFS, floor: {noise_floor:.1f} dB")
                     
                     last_stats_time = current_time
                     
                 except Exception as e:
-                    self.log("error", f"Stats worker error: {e}")
+                    print(f"RMS       ERROR = Stats worker error: {e}")
             
             time.sleep(1.0)  # Check every second
     
@@ -350,7 +359,8 @@ class RMSService:
         self.stats_thread = threading.Thread(target=self.stats_worker, daemon=True)
         self.stats_thread.start()
         
-        self.log("info", "Background threads started")
+        # Use sync fallback for thread startup
+        print("RMS       INFO  = Background threads started")
     
     def stop_sampler(self):
         """Stop background sampling"""
@@ -363,7 +373,8 @@ class RMSService:
         if self.stats_thread and self.stats_thread.is_alive():
             self.stats_thread.join(timeout=2.0)
         
-        self.log("info", "Background threads stopped")
+        # Use sync fallback for thread shutdown
+        print("RMS       INFO  = Background threads stopped")
     
     def get_current_rms(self) -> CurrentRMSResponse:
         """Get current RMS metrics"""
@@ -377,7 +388,7 @@ class RMSService:
     async def startup(self):
         """Service startup logic"""
         try:
-            self.log("info", "RMS service starting", "service_start")
+            await self.log("info", "RMS service starting", "service_start")
             
             # Initialize audio device
             if not self.initialize_audio_device():
@@ -391,17 +402,17 @@ class RMSService:
             time.sleep(0.5)
             
             self.state = RMSState.READY
-            self.log("info", "RMS service ready", "service_ready")
+            await self.log("info", "RMS service ready", "service_ready")
             return True
             
         except Exception as e:
-            self.log("error", f"RMS startup failed: {e}")
+            await self.log("error", f"RMS startup failed: {e}")
             self.state = RMSState.ERROR
             return False
     
     async def shutdown(self):
         """Service shutdown logic"""
-        self.log("info", "RMS service shutting down")
+        await self.log("info", "RMS service shutting down")
         self.stop_sampler()
 
 
@@ -410,9 +421,11 @@ rms_service = RMSService()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def service_lifespan():
     # Startup
-    await rms_service.startup()
+    success = await rms_service.startup()
+    if not success:
+        raise RuntimeError("RMS service startup failed")
     yield
     # Shutdown
     await rms_service.shutdown()
@@ -423,7 +436,7 @@ app = FastAPI(
     title="RMS Service",
     description="Dynamic Background Noise Monitoring",
     version="1.0",
-    lifespan=lifespan
+    lifespan=lambda app: lifespan_with_httpx(service_lifespan)
 )
 
 

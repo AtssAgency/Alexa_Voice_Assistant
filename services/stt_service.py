@@ -22,12 +22,12 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import sounddevice as sd
-import requests
 import websockets
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 from .config_loader import app_config
+from .shared import lifespan_with_httpx, safe_post, safe_get
 
 # ============
 # Runtime env (stability for CTranslate2 / faster-whisper)
@@ -199,26 +199,23 @@ class STTService:
     # ---------------
     # Logging
     # ---------------
-    def log(self, level: str, message: str, event: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
-        try:
-            payload = {"svc": "STT", "level": level, "message": message}
-            if event:
-                payload["event"] = event
-            if extra:
-                payload["extra"] = extra
-            requests.post(f"{self.logger_url}/log", json=payload, timeout=1.5)
-        except Exception:
-            print(f"STT {level.upper():<5} {message}")
+    async def log(self, level: str, message: str, event: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
+        payload = {"svc": "STT", "level": level, "message": message}
+        if event:
+            payload["event"] = event
+        if extra:
+            payload["extra"] = extra
+        
+        fallback_msg = f"STT       {level.upper():<6}= {message}"
+        await safe_post(f"{self.logger_url}/log", json=payload, timeout=1.5, fallback_msg=fallback_msg)
 
-    def log_dialog(self, dialog_id: str, role: str, text: str):
-        try:
-            requests.post(
-                f"{self.logger_url}/dialog/line",
-                json={"dialog_id": dialog_id, "role": role, "text": text},
-                timeout=1.5,
-            )
-        except Exception:
-            pass
+    async def log_dialog(self, dialog_id: str, role: str, text: str):
+        await safe_post(
+            f"{self.logger_url}/dialog/line",
+            json={"dialog_id": dialog_id, "role": role, "text": text},
+            timeout=1.5,
+            fallback_msg=""  # No fallback for dialog logging
+        )
 
 
     # ---------------
@@ -284,7 +281,8 @@ class STTService:
                 if d.get("max_input_channels", 0) > 0:
                     return i
         except Exception as e:
-            self.log("warning", f"Device resolution error: {e}")
+            # Use sync fallback in device resolution
+            print(f"STT       WARNING= Device resolution error: {e}")
 
         return -1
 
@@ -294,19 +292,18 @@ class STTService:
             info = sd.query_devices(idx) if idx >= 0 else {}
         except Exception:
             info = {}
-        self.log(
-            "info",
-            f"[{when}] Resolved input device → index={idx}, "
-            f"name={info.get('name')}, rate={info.get('default_samplerate')}, "
-            f"max_in={info.get('max_input_channels')}"
-        )
+        # Use sync fallback for device logging during startup
+        print(f"STT       INFO  = [{when}] Resolved input device → index={idx}, "
+              f"name={info.get('name')}, rate={info.get('default_samplerate')}, "
+              f"max_in={info.get('max_input_channels')}")
 
     # ---------------
     # Audio I/O
     # ---------------
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
-            self.log("warning", f"Audio callback status: {status}")
+            # Use sync fallback in audio callback
+            print(f"STT       WARNING= Audio callback status: {status}")
         frame = indata[:, 0].copy()  # int16 mono
         self._raw_queue.append(frame)
 
@@ -331,7 +328,8 @@ class STTService:
                 callback=self._audio_callback,
             )
             self.audio_stream.start()
-            self.log("info", f"Audio started (device={device_idx}, {self.frame_ms}ms frames)")
+            # Use sync fallback for audio startup logging
+            print(f"STT       INFO  = Audio started (device={device_idx}, {self.frame_ms}ms frames)")
 
             # Warm-up probe: ensure frames arrive (dead-mic guard)
             t0 = time.time()
@@ -339,7 +337,7 @@ class STTService:
                 time.sleep(0.01)
 
             if not self._raw_queue:
-                self.log("warning", "No audio frames after 500ms; retrying on system default device=None")
+                print("STT       WARNING= No audio frames after 500ms; retrying on system default device=None")
                 try:
                     if self.audio_stream:
                         self.audio_stream.stop()
@@ -355,11 +353,11 @@ class STTService:
                     callback=self._audio_callback,
                 )
                 self.audio_stream.start()
-                self.log("info", "Audio restarted on system default device")
+                print("STT       INFO  = Audio restarted on system default device")
             return True
 
         except Exception as e:
-            self.log("error", f"Failed to start audio: {e}")
+            print(f"STT       ERROR = Failed to start audio: {e}")
             return False
 
     def _stop_audio(self):
@@ -368,10 +366,10 @@ class STTService:
                 self.audio_stream.stop()
                 self.audio_stream.close()
             except Exception as e:
-                self.log("warning", f"Error stopping audio: {e}")
+                print(f"STT       WARNING= Error stopping audio: {e}")
             finally:
                 self.audio_stream = None
-                self.log("info", "Audio stopped")
+                print("STT       INFO  = Audio stopped")
 
     # ---------------
     # VAD capture
@@ -403,7 +401,7 @@ class STTService:
             start_consec = 0
             started = False
 
-            self.log("info", "Listening for speech...")
+            print("STT       INFO  = Listening for speech...")
 
             while not self.stop_flag.is_set():
                 if not self._raw_queue:
@@ -456,11 +454,11 @@ class STTService:
                 # Safety cap
                 max_frames = int(self.chunk_length_s * 1000 / self.frame_ms)
                 if len(utter) > max_frames:
-                    self.log("warning", "Max recording length reached")
+                    print("STT       WARNING= Max recording length reached")
                     break
 
             if not utter:
-                self.log("warning", "No speech captured")
+                print("STT       WARNING= No speech captured")
                 return None
 
             # Add speech pads at both ends if available
@@ -475,7 +473,7 @@ class STTService:
             return audio_f32
 
         except Exception as e:
-            self.log("error", f"capture error: {e}")
+            print(f"STT       ERROR = capture error: {e}")
             return None
         finally:
             self._stop_audio()
@@ -493,12 +491,21 @@ class STTService:
             )
             text = " ".join([seg.text.strip() for seg in segments]).strip()
             if not text:
-                self.log("warning", "Empty transcription")
+                print("STT       WARNING= Empty transcription")
                 return None
-            self.log("info", f"USER: {text}", "stt_final_text")
+            
+            # Use asyncio bridge for logging transcription result
+            try:
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    self.log("info", f"USER: {text}", "stt_final_text"),
+                    loop
+                )
+            except:
+                print(f"STT       INFO  = USER: {text}")
             return text
         except Exception as e:
-            self.log("error", f"Transcription error: {e}")
+            print(f"STT       ERROR = Transcription error: {e}")
             return None
 
     # ---------------
@@ -508,10 +515,10 @@ class STTService:
         try:
             self.tts_speak_ws = await websockets.connect(self.tts_ws_speak)
             self.tts_events_ws = await websockets.connect(f"{self.tts_ws_events}/{dialog_id}")
-            self.log("debug", "Connected to TTS WebSockets")
+            await self.log("debug", "Connected to TTS WebSockets")
             return True
         except Exception as e:
-            self.log("error", f"TTS WS connect failed: {e}")
+            await self.log("error", f"TTS WS connect failed: {e}")
             return False
 
     async def _disconnect_tts_ws(self):
@@ -521,114 +528,116 @@ class STTService:
             if self.tts_events_ws:
                 await self.tts_events_ws.close()
         except Exception as e:
-            self.log("warning", f"TTS WS disconnect error: {e}")
+            await self.log("warning", f"TTS WS disconnect error: {e}")
         finally:
             self.tts_speak_ws = None
             self.tts_events_ws = None
 
     async def _stream_llm_to_tts(self, dialog_id: str, user_text: str) -> bool:
         try:
-            self.log("info", "Starting LLM completion stream", "llm_stream_started")
-            r = requests.post(self.llm_complete_url, json={
-                "text": user_text,
-                "dialog_id": dialog_id
-            }, stream=True, timeout=120.0)
+            await self.log("info", "Starting LLM completion stream", "llm_stream_started")
+            
+            # Use httpx for streaming HTTP request
+            import httpx
+            async with httpx.AsyncClient() as client:
+                async with client.stream("POST", self.llm_complete_url, json={
+                    "text": user_text,
+                    "dialog_id": dialog_id
+                }, timeout=120.0) as r:
 
-            if r.status_code != 200:
-                self.log("error", f"LLM request failed: {r.status_code}")
-                return False
+                    if r.status_code != 200:
+                        await self.log("error", f"LLM request failed: {r.status_code}")
+                        return False
 
-            full = ""
-            for line in r.iter_lines():
-                if self.stop_flag.is_set():
-                    break
-                if not line:
-                    continue
-                s = line.decode("utf-8")
-                if s.startswith("data: "):
-                    payload = s[6:].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        j = json.loads(payload)
-                        chunk = j.get("text", "")
-                        if chunk and self.tts_speak_ws:
-                            await self.tts_speak_ws.send(json.dumps({"text_chunk": chunk}))
-                            full += chunk
-                    except json.JSONDecodeError:
-                        continue
+                    full = ""
+                    async for line in r.aiter_lines():
+                        if self.stop_flag.is_set():
+                            break
+                        if not line:
+                            continue
+                        s = line
+                        if s.startswith("data: "):
+                            payload = s[6:].strip()
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                j = json.loads(payload)
+                                chunk = j.get("text", "")
+                                if chunk and self.tts_speak_ws:
+                                    await self.tts_speak_ws.send(json.dumps({"text_chunk": chunk}))
+                                    full += chunk
+                            except json.JSONDecodeError:
+                                continue
 
-            if full:
-                self.log("info", f"ALEXA: {full}", "llm_stream_end")
-                self.log_dialog(dialog_id, "USER", user_text)
-                self.log_dialog(dialog_id, "ALEXA", full)
-            return True
+                    if full:
+                        await self.log("info", f"ALEXA: {full}", "llm_stream_end")
+                        await self.log_dialog(dialog_id, "USER", user_text)
+                        await self.log_dialog(dialog_id, "ALEXA", full)
+                    return True
         except Exception as e:
-            self.log("error", f"LLM streaming error: {e}")
+            await self.log("error", f"LLM streaming error: {e}")
             return False
 
     async def _wait_tts_done(self, dialog_id: str) -> bool:
         try:
             if not self.tts_events_ws:
                 return False
-            self.log("debug", "Waiting for TTS playback completion")
+            await self.log("debug", "Waiting for TTS playback completion")
             while not self.stop_flag.is_set():
                 try:
                     msg = await asyncio.wait_for(self.tts_events_ws.recv(), timeout=30.0)
                     ev = json.loads(msg)
                     et = ev.get("event")
                     if et == "playback_finished":
-                        self.log("info", "TTS playback completed", "tts_playback_finished")
+                        await self.log("info", "TTS playback completed", "tts_playback_finished")
                         return True
                     if et == "playback_error":
-                        self.log("warning", "TTS playback error")
+                        await self.log("warning", "TTS playback error")
                         return False
                 except asyncio.TimeoutError:
-                    self.log("warning", "Timeout waiting for TTS completion")
+                    await self.log("warning", "Timeout waiting for TTS completion")
                     return False
                 except json.JSONDecodeError:
                     continue
         except Exception as e:
-            self.log("error", f"TTS completion wait error: {e}")
+            await self.log("error", f"TTS completion wait error: {e}")
             return False
 
     # ---------------
     # KWD re-arm (state-aware)
     # ---------------
-    def _rearm_kwd(self):
+    async def _rearm_kwd(self):
         try:
-            r = requests.get(self.kwd_state_url, timeout=1.5)
-            if r.status_code != 200:
-                self.log("warning", f"KWD state probe failed: {r.status_code}")
+            data = await safe_get(self.kwd_state_url, timeout=1.5)
+            if not data:
+                await self.log("warning", "KWD state probe failed")
                 return
-            st = (r.json() or {}).get("state", "").upper()
+            st = data.get("state", "").upper()
             if st not in ("READY", "SLEEP"):
-                self.log("info", f"KWD is {st}; skip re-arm")
+                await self.log("info", f"KWD is {st}; skip re-arm")
                 return
-            r2 = requests.post(self.kwd_start_url, timeout=2.0)
-            if r2.status_code == 200:
-                self.log("info", "KWD re-armed successfully")
+            
+            result = await safe_post(self.kwd_start_url, timeout=2.0, fallback_msg="")
+            if result is not None:
+                await self.log("info", "KWD re-armed successfully")
             else:
-                self.log("warning", f"KWD re-arm failed: {r2.status_code}")
+                await self.log("warning", "KWD re-arm failed")
         except Exception as e:
-            self.log("warning", f"KWD re-arm error: {e}")
+            await self.log("warning", f"KWD re-arm error: {e}")
 
     # ---------------
     # Dialog worker
     # ---------------
     async def _dialog_worker(self, dialog_id: str):
         try:
-            self.log("info", f"Dialog started: {dialog_id}", "dialog_turn_started")
+            await self.log("info", f"Dialog started: {dialog_id}", "dialog_turn_started")
             # Start dialog in logger
-            try:
-                requests.post(f"{self.logger_url}/dialog/start", json={"dialog_id": dialog_id}, timeout=1.5)
-            except Exception:
-                pass
+            await safe_post(f"{self.logger_url}/dialog/start", json={"dialog_id": dialog_id}, timeout=1.5, fallback_msg="")
 
             # 1) Capture
             audio = self._capture_utterance_silero()
             if audio is None or self.stop_flag.is_set():
-                self.log("warning", "No user speech captured")
+                await self.log("warning", "No user speech captured")
                 return
 
             # 2) Transcribe
@@ -651,30 +660,28 @@ class STTService:
             await asyncio.sleep(self.follow_up_timer_sec)
 
         except Exception as e:
-            self.log("error", f"Dialog worker error: {e}")
+            await self.log("error", f"Dialog worker error: {e}")
         finally:
             await self._disconnect_tts_ws()
             # End dialog
-            try:
-                requests.post(f"{self.logger_url}/dialog/end", json={"dialog_id": dialog_id}, timeout=1.5)
-            except Exception:
-                pass
+            await safe_post(f"{self.logger_url}/dialog/end", json={"dialog_id": dialog_id}, timeout=1.5, fallback_msg="")
+            
             # Rearm wake word
-            self._rearm_kwd()
+            await self._rearm_kwd()
             # Reset state
             self.active_dialog_id = None
             self.state = STTState.READY
-            self.log("info", f"Dialog ended: {dialog_id}", "dialog_ended")
+            await self.log("info", f"Dialog ended: {dialog_id}", "dialog_ended")
 
-    def start_dialog(self, dialog_id: str) -> bool:
+    async def start_dialog(self, dialog_id: str) -> bool:
         if self.state != STTState.READY:
-            self.log("warning", f"Cannot start dialog in state {self.state}")
+            await self.log("warning", f"Cannot start dialog in state {self.state}")
             return False
         if self.model is None:
-            self.log("warning", "Start rejected: Whisper not loaded yet")
+            await self.log("warning", "Start rejected: Whisper not loaded yet")
             return False
         if self.active_dialog_id:
-            self.log("warning", f"Dialog already active: {self.active_dialog_id}")
+            await self.log("warning", f"Dialog already active: {self.active_dialog_id}")
             return False
 
         try:
@@ -688,16 +695,16 @@ class STTService:
             self.dialog_thread.start()
             return True
         except Exception as e:
-            self.log("error", f"Failed to start dialog: {e}")
+            await self.log("error", f"Failed to start dialog: {e}")
             self.active_dialog_id = None
             self.state = STTState.READY
             return False
 
-    def stop_dialog(self, dialog_id: str, reason: str = "manual") -> bool:
+    async def stop_dialog(self, dialog_id: str, reason: str = "manual") -> bool:
         if not self.active_dialog_id or self.active_dialog_id != dialog_id:
             return False
         try:
-            self.log("info", f"Stopping dialog: {reason}")
+            await self.log("info", f"Stopping dialog: {reason}")
             self.stop_flag.set()
             if self.dialog_thread and self.dialog_thread.is_alive():
                 self.dialog_thread.join(timeout=5.0)
@@ -705,7 +712,7 @@ class STTService:
             self.state = STTState.READY
             return True
         except Exception as e:
-            self.log("error", f"Error stopping dialog: {e}")
+            await self.log("error", f"Error stopping dialog: {e}")
             return False
 
     # ---------------
@@ -713,21 +720,22 @@ class STTService:
     # ---------------
     def _load_asr_model(self) -> bool:
         try:
-            self.log("info", f"Loading Whisper model: {self.model_size} on {self.whisper_device}")
+            # Use sync fallback for model loading in background thread
+            print(f"STT       INFO  = Loading Whisper model: {self.model_size} on {self.whisper_device}")
             self.model = WhisperModel(
                 self.model_size,
                 device=self.whisper_device,
                 compute_type=self.compute_type
             )
-            self.log("info", "Whisper model loaded", "model_loaded")
+            print("STT       INFO  = Whisper model loaded")
             return True
         except Exception as e:
-            self.log("error", f"Failed to load Whisper model: {e}")
+            print(f"STT       ERROR = Failed to load Whisper model: {e}")
             self.model = None
             return False
 
     async def startup(self):
-        self.log("info", "STT service starting", "service_start")
+        await self.log("info", "STT service starting", "service_start")
         
         # Log resolved audio device at startup (observability)
         self._log_resolved_device("startup")
@@ -736,17 +744,17 @@ class STTService:
         def _bg_load():
             ok = self._load_asr_model()
             if not ok:
-                self.log("error", "Whisper load failed; /start will be rejected until fixed")
+                print("STT       ERROR = Whisper load failed; /start will be rejected until fixed")
 
         threading.Thread(target=_bg_load, daemon=True).start()
 
         # VAD is lazy-loaded on first capture
         self.state = STTState.READY
-        self.log("info", "STT service ready", "service_ready")
+        await self.log("info", "STT service ready", "service_ready")
         return True
 
     async def shutdown(self):
-        self.log("info", "STT service shutting down")
+        await self.log("info", "STT service shutting down")
         # Stop any active dialog
         if self.active_dialog_id:
             self.stop_flag.set()
@@ -764,18 +772,18 @@ class STTService:
 stt_service = STTService()
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    await stt_service.startup()
-    try:
-        yield
-    finally:
-        await stt_service.shutdown()
+async def service_lifespan():
+    success = await stt_service.startup()
+    if not success:
+        raise RuntimeError("STT service startup failed")
+    yield
+    await stt_service.shutdown()
 
 app = FastAPI(
     title="STT Service",
     description="Silero VAD + faster-whisper dialog manager",
     version="1.3",
-    lifespan=lifespan
+    lifespan=lambda app: lifespan_with_httpx(service_lifespan)
 )
 
 
@@ -785,7 +793,7 @@ async def start_dialog(request: StartRequest):
         raise HTTPException(status_code=400, detail=f"Service not ready (state={stt_service.state})")
     if stt_service.model is None:
         raise HTTPException(status_code=503, detail="ASR model is still loading")
-    if stt_service.start_dialog(request.dialog_id):
+    if await stt_service.start_dialog(request.dialog_id):
         return {"status": "ok", "dialog_id": request.dialog_id}
     raise HTTPException(status_code=500, detail="Failed to start dialog")
 
@@ -793,7 +801,7 @@ async def start_dialog(request: StartRequest):
 @app.post("/stop")
 async def stop_dialog(request: StopRequest):
     reason = request.reason or "manual stop"
-    if stt_service.stop_dialog(request.dialog_id, reason):
+    if await stt_service.stop_dialog(request.dialog_id, reason):
         return {"status": "ok", "dialog_id": request.dialog_id}
     raise HTTPException(status_code=404, detail="Dialog not found or already stopped")
 

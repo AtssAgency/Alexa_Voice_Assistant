@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, AsyncGenerator
 import re
 
-import requests
 import torch
 import sounddevice as sd
 import numpy as np
@@ -34,6 +33,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 from .config_loader import app_config
+from .shared import lifespan_with_httpx, safe_post, safe_get
 
 # Import Kokoro TTS components
 try:
@@ -148,87 +148,39 @@ class TTSService:
         self.state_lock = threading.Lock()
         self.queue_lock = threading.Lock()
     
-    def load_config(self) -> bool:
-        """Load configuration from config files"""
-        try:
-            config_path = Path("config/config.ini")
-            if config_path.exists():
-                self.config = configparser.ConfigParser()
-                self.config.read(config_path)
-                
-                # Load TTS section
-                if 'tts' in self.config:
-                    tts_section = self.config['tts']
-                    self.port = tts_section.getint('port', self.port)
-                    self.voice = tts_section.get('voice', self.voice)
-                    self.sample_rate = tts_section.getint('sample_rate', self.sample_rate)
-                    self.device = tts_section.get('device', self.device)
-                    self.dtype = tts_section.get('dtype', self.dtype)
-                    self.max_queue_text = tts_section.getint('max_queue_text', self.max_queue_text)
-                    self.max_queue_audio = tts_section.getint('max_queue_audio', self.max_queue_audio)
-                    self.chunk_chars = tts_section.getint('chunk_chars', self.chunk_chars)
-                    self.silence_pad_ms = tts_section.getint('silence_pad_ms', self.silence_pad_ms)
-                    self.allow_llm_pull = tts_section.getboolean('allow_llm_pull', self.allow_llm_pull)
-                    
-                    # ONNX assets
-                    self.model_path = tts_section.get('model_path', self.model_path)
-                    self.voices_path = tts_section.get('voices_path', self.voices_path)
-                    self.quant_preference = tts_section.get('quant_preference', self.quant_preference)
-                
-                # Load dependencies section
-                if 'deps' in self.config:
-                    deps_section = self.config['deps']
-                    self.logger_url = deps_section.get('logger_url', self.logger_url)
-            
-            self.log("info", "Configuration loaded successfully", "config_loaded")
-            return True
-            
-        except Exception as e:
-            self.log("error", f"Failed to load config: {e}")
-            return False
     
-    def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
+    async def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
-        try:
-            # Add human-readable timestamp (dd-mm-yy HH:MM:SS format)
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%d-%m-%y %H:%M:%S")
+        payload = {
+            "svc": "TTS",
+            "level": level,
+            "message": message,
+        }
+        if event:
+            payload["event"] = event
+        if extra:
+            payload["extra"] = extra
             
-            payload = {
-                "svc": "TTS",
-                "level": level,
-                "message": message,
-            }
-            if event:
-                payload["event"] = event
-            if extra:
-                payload["extra"] = extra
-                
-            requests.post(f"{self.logger_url}/log", json=payload, timeout=2.0)
-        except Exception:
-            # Fallback to stdout if logger unavailable
-            print(f"TTS       {level.upper():<6}= {message}")
+        fallback_msg = f"TTS       {level.upper():<6}= {message}"
+        await safe_post(f"{self.logger_url}/log", json=payload, timeout=2.0, fallback_msg=fallback_msg)
     
-    def send_metric(self, metric: str, value: float, dialog_id: str = None):
+    async def send_metric(self, metric: str, value: float, dialog_id: str = None):
         """Send metric to Logger service"""
-        try:
-            payload = {
-                "svc": "TTS",
-                "metric": metric,
-                "value": value
-            }
-            if dialog_id:
-                payload["dialog_id"] = dialog_id
-                
-            requests.post(f"{self.logger_url}/metrics", json=payload, timeout=2.0)
-        except Exception:
-            pass
+        payload = {
+            "svc": "TTS",
+            "metric": metric,
+            "value": value
+        }
+        if dialog_id:
+            payload["dialog_id"] = dialog_id
+            
+        await safe_post(f"{self.logger_url}/metrics", json=payload, timeout=2.0, fallback_msg="")
     
     def initialize_cuda(self) -> bool:
         """Initialize CUDA for TTS inference"""
         try:
             if not torch.cuda.is_available():
-                self.log("error", "CUDA not available")
+                print("TTS       ERROR = CUDA not available")
                 return False
             
             # Set device
@@ -237,18 +189,18 @@ class TTSService:
             # Clear cache
             torch.cuda.empty_cache()
             
-            self.log("info", f"CUDA initialized on device 0", "cuda_initialized")
+            print("TTS       INFO  = CUDA initialized on device 0")
             return True
             
         except Exception as e:
-            self.log("error", f"Failed to initialize CUDA: {e}")
+            print(f"TTS       ERROR = Failed to initialize CUDA: {e}")
             return False
     
     def initialize_tts_engine(self) -> bool:
         """Initialize Kokoro TTS engine"""
         try:
             if not KOKORO_AVAILABLE:
-                self.log("error", "Kokoro TTS not available")
+                print("TTS       ERROR = Kokoro TTS not available")
                 return False
             
             # Check if model and voices files exist
@@ -256,11 +208,11 @@ class TTSService:
             voices_path = Path(self.voices_path)
             
             if not model_path.exists():
-                self.log("error", f"Model file not found: {self.model_path}")
+                print(f"TTS       ERROR = Model file not found: {self.model_path}")
                 return False
             
             if not voices_path.exists():
-                self.log("error", f"Voices file not found: {self.voices_path}")
+                print(f"TTS       ERROR = Voices file not found: {self.voices_path}")
                 return False
             
             # Initialize Kokoro with model and voices paths
@@ -273,11 +225,11 @@ class TTSService:
                 # if device == "cuda" else "cpu",
             )
             
-            self.log("info", f"TTS engine initialized with voice {self.voice}, model: {self.model_path}", "model_loaded")
+            print(f"TTS       INFO  = TTS engine initialized with voice {self.voice}, model: {self.model_path}")
             return True
             
         except Exception as e:
-            self.log("error", f"Failed to initialize TTS engine: {e}")
+            print(f"TTS       ERROR = Failed to initialize TTS engine: {e}")
             return False
     
     def initialize_audio_device(self) -> bool:
@@ -290,11 +242,11 @@ class TTSService:
             device_info = sd.query_devices(default_device)
             self.audio_device = default_device
             
-            self.log("info", f"Audio device initialized: {device_info['name']}", "audio_initialized")
+            print(f"TTS       INFO  = Audio device initialized: {device_info['name']}")
             return True
             
         except Exception as e:
-            self.log("error", f"Failed to initialize audio device: {e}")
+            print(f"TTS       ERROR = Failed to initialize audio device: {e}")
             return False
     
     def chunk_text(self, text: str) -> List[str]:
@@ -339,7 +291,7 @@ class TTSService:
             
             # Update sample rate if different from config
             if sample_rate != self.sample_rate:
-                self.log("info", f"Using Kokoro sample rate: {sample_rate} Hz")
+                print(f"TTS       INFO  = Using Kokoro sample rate: {sample_rate} Hz")
                 self.sample_rate = sample_rate
             
             # Convert to numpy array if needed
@@ -351,12 +303,20 @@ class TTSService:
                 audio_data = audio_data.astype(np.float32)
             
             synth_time = (time.time() - start_time) * 1000
-            self.send_metric("chunk_synth_ms", synth_time)
+            # Use asyncio bridge for metrics from sync context
+            try:
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    self.send_metric("chunk_synth_ms", synth_time),
+                    loop
+                )
+            except:
+                pass
             
             return audio_data
             
         except Exception as e:
-            self.log("error", f"Synthesis failed: {e}")
+            print(f"TTS       ERROR = Synthesis failed: {e}")
             return None
     
     def synthesis_worker(self):
@@ -399,7 +359,7 @@ class TTSService:
                 self.text_queue.task_done()
                 
             except Exception as e:
-                self.log("error", f"Synthesis worker error: {e}")
+                print(f"TTS       ERROR = Synthesis worker error: {e}")
     
     def playback_worker(self):
         """Background thread for audio playback"""
@@ -425,7 +385,7 @@ class TTSService:
                 self.audio_queue.task_done()
                 
             except Exception as e:
-                self.log("error", f"Playback worker error: {e}")
+                print(f"TTS       ERROR = Playback worker error: {e}")
     
     def play_audio_chunk(self, audio_data: np.ndarray, dialog_id: str):
         """Play a single audio chunk"""
@@ -434,7 +394,7 @@ class TTSService:
                 self.is_playing = True
                 self.playback_start_time = time.time()
                 # Skip event emission from background thread to avoid asyncio issues
-                self.log("debug", f"Playback started for dialog {dialog_id}")
+                print(f"TTS       DEBUG = Playback started for dialog {dialog_id}")
             
             # Play audio using sounddevice
             sd.play(audio_data, samplerate=self.sample_rate, device=self.audio_device)
@@ -443,10 +403,10 @@ class TTSService:
             # Log progress instead of emitting events from background thread
             if self.playback_start_time:
                 elapsed_ms = (time.time() - self.playback_start_time) * 1000
-                self.log("debug", f"Audio playback progress: {elapsed_ms:.0f}ms")
+                print(f"TTS       DEBUG = Audio playback progress: {elapsed_ms:.0f}ms")
             
         except Exception as e:
-            self.log("error", f"Audio playback error: {e}")
+            print(f"TTS       ERROR = Audio playback error: {e}")
     
     async def emit_playback_event(self, event_type: str, dialog_id: str, at_ms: Optional[float] = None):
         """Emit playback event to WebSocket subscribers"""
@@ -481,7 +441,7 @@ class TTSService:
         self.synthesis_thread.start()
         self.playback_thread.start()
         
-        self.log("info", "Processing threads started")
+        print("TTS       INFO  = Processing threads started")
     
     def stop_processing_threads(self):
         """Stop background processing threads"""
@@ -501,7 +461,7 @@ class TTSService:
         if self.playback_thread and self.playback_thread.is_alive():
             self.playback_thread.join(timeout=2.0)
         
-        self.log("info", "Processing threads stopped")
+        print("TTS       INFO  = Processing threads stopped")
     
     def clear_queues(self):
         """Clear all queues"""
@@ -525,7 +485,7 @@ class TTSService:
         try:
             # Use current voice if not specified
             if voice and voice != self.voice:
-                self.log("warning", f"Voice switching not implemented, using {self.voice}")
+                await self.log("warning", f"Voice switching not implemented, using {self.voice}")
             
             # Update state
             with self.state_lock:
@@ -537,14 +497,14 @@ class TTSService:
             # Add to synthesis queue
             self.text_queue.put((text, dialog_id), block=False)
             
-            self.log("info", f"Text queued for synthesis: {len(text)} chars", "chunk_received")
+            await self.log("info", f"Text queued for synthesis: {len(text)} chars", "chunk_received")
             return True
             
         except queue.Full:
-            self.log("error", "Text queue full, dropping text")
+            await self.log("error", "Text queue full, dropping text")
             return False
         except Exception as e:
-            self.log("error", f"Failed to queue text: {e}")
+            await self.log("error", f"Failed to queue text: {e}")
             return False
     
     async def stop_playback(self, dialog_id: str):
@@ -571,10 +531,10 @@ class TTSService:
                 self.current_dialog_id = None
                 self.should_stop = False
             
-            self.log("info", "Playback stopped", "stream_aborted")
+            await self.log("info", "Playback stopped", "stream_aborted")
             
         except Exception as e:
-            self.log("error", f"Failed to stop playback: {e}")
+            await self.log("error", f"Failed to stop playback: {e}")
     
     async def speak_from_llm(self, request: SpeakFromLLMRequest) -> bool:
         """Pull text stream from LLM and synthesize"""
@@ -590,49 +550,46 @@ class TTSService:
                 "params": request.params or {}
             }
             
-            # Start streaming request to LLM
-            response = requests.post(
-                request.llm_url,
-                json=llm_payload,
-                stream=True,
-                timeout=120.0
-            )
-            
-            if response.status_code != 200:
-                self.log("error", f"LLM request failed: {response.status_code}")
-                return False
-            
-            # Process LLM stream
-            accumulated_text = ""
-            
-            for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
-                if chunk and not self.should_stop:
-                    accumulated_text += chunk
+            # Start streaming request to LLM using httpx
+            import httpx
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    request.llm_url,
+                    json=llm_payload,
+                    timeout=120.0
+                ) as response:
                     
-                    # Process in sentence chunks
-                    if len(accumulated_text) >= self.chunk_chars or chunk.endswith(('.', '!', '?')):
+                    if response.status_code != 200:
+                        await self.log("error", f"LLM request failed: {response.status_code}")
+                        return False
+                    
+                    # Process LLM stream
+                    accumulated_text = ""
+                    
+                    async for chunk in response.aiter_text(chunk_size=1024):
+                        if chunk and not self.should_stop:
+                            accumulated_text += chunk
+                            
+                            # Process in sentence chunks
+                            if len(accumulated_text) >= self.chunk_chars or chunk.endswith(('.', '!', '?')):
+                                await self.speak_text(accumulated_text, request.dialog_id)
+                                accumulated_text = ""
+                    
+                    # Process remaining text
+                    if accumulated_text and not self.should_stop:
                         await self.speak_text(accumulated_text, request.dialog_id)
-                        accumulated_text = ""
-            
-            # Process remaining text
-            if accumulated_text and not self.should_stop:
-                await self.speak_text(accumulated_text, request.dialog_id)
             
             return True
             
         except Exception as e:
-            self.log("error", f"LLM pull failed: {e}")
+            await self.log("error", f"LLM pull failed: {e}")
             return False
     
     async def startup(self):
         """Service startup logic"""
         try:
-            self.log("info", "TTS service starting", "service_start")
-            
-            # Load configuration
-            if not self.load_config():
-                self.state = TTSState.INIT
-                return False
+            await self.log("info", "TTS service starting", "service_start")
             
             # Initialize CUDA
             if not self.initialize_cuda():
@@ -653,17 +610,17 @@ class TTSService:
             self.start_processing_threads()
             
             self.state = TTSState.READY
-            self.log("info", "TTS service ready", "service_ready")
+            await self.log("info", "TTS service ready", "service_ready")
             return True
             
         except Exception as e:
-            self.log("error", f"TTS startup failed: {e}")
+            await self.log("error", f"TTS startup failed: {e}")
             self.state = TTSState.INIT
             return False
     
     async def shutdown(self):
         """Service shutdown logic"""
-        self.log("info", "TTS service shutting down")
+        await self.log("info", "TTS service shutting down")
         
         # Stop playback
         sd.stop()
@@ -690,9 +647,11 @@ tts_service = TTSService()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def service_lifespan():
     # Startup
-    await tts_service.startup()
+    success = await tts_service.startup()
+    if not success:
+        raise RuntimeError("TTS service startup failed")
     yield
     # Shutdown
     await tts_service.shutdown()
@@ -703,7 +662,7 @@ app = FastAPI(
     title="TTS Service",
     description="Streaming Text-to-Speech using Kokoro",
     version="1.0",
-    lifespan=lifespan
+    lifespan=lambda app: lifespan_with_httpx(service_lifespan)
 )
 
 
@@ -754,9 +713,24 @@ async def speak_stream(websocket: WebSocket):
             await websocket.send_text(json.dumps(ack_message))
             
     except WebSocketDisconnect:
-        tts_service.log("info", "Speak stream WebSocket disconnected")
+        # Use asyncio bridge for logging from WebSocket context
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                tts_service.log("info", "Speak stream WebSocket disconnected"),
+                loop
+            )
+        except:
+            print("TTS       INFO  = Speak stream WebSocket disconnected")
     except Exception as e:
-        tts_service.log("error", f"Speak stream error: {e}")
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                tts_service.log("error", f"Speak stream error: {e}"),
+                loop
+            )
+        except:
+            print(f"TTS       ERROR = Speak stream error: {e}")
 
 
 @app.websocket("/playback-events/{dialog_id}")
@@ -782,9 +756,24 @@ async def playback_events(websocket: WebSocket, dialog_id: str):
                     del tts_service.event_connections[dialog_id]
             except ValueError:
                 pass
-        tts_service.log("info", f"Playback events WebSocket disconnected for dialog {dialog_id}")
+        # Use asyncio bridge for logging from WebSocket context
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                tts_service.log("info", f"Playback events WebSocket disconnected for dialog {dialog_id}"),
+                loop
+            )
+        except:
+            print(f"TTS       INFO  = Playback events WebSocket disconnected for dialog {dialog_id}")
     except Exception as e:
-        tts_service.log("error", f"Playback events error: {e}")
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                tts_service.log("error", f"Playback events error: {e}"),
+                loop
+            )
+        except:
+            print(f"TTS       ERROR = Playback events error: {e}")
 
 
 @app.post("/speak-from-llm")
@@ -813,22 +802,6 @@ async def stop_playback(request: StopRequest):
     await tts_service.stop_playback(request.dialog_id)
     return {"status": "ok", "message": "Playback stopped"}
 
-
-@app.post("/reload")
-async def reload_config():
-    """Reload configuration from files"""
-    if tts_service.load_config():
-        return {
-            "status": "ok",
-            "config": {
-                "voice": tts_service.voice,
-                "sample_rate": tts_service.sample_rate,
-                "chunk_chars": tts_service.chunk_chars,
-                "allow_llm_pull": tts_service.allow_llm_pull
-            }
-        }
-    else:
-        raise HTTPException(status_code=500, detail="Failed to reload configuration")
 
 
 @app.get("/health")

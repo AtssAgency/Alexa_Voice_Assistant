@@ -22,13 +22,13 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, AsyncGenerator
 import re
 
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 from .config_loader import app_config
+from .shared import lifespan_with_httpx, safe_post, safe_get
 
 
 class LLMState:
@@ -98,12 +98,12 @@ class LLMService:
         try:
             modelfile_path = Path("config/Modelfile")
             if not modelfile_path.exists():
-                self.log("warning", "config/Modelfile not found, using defaults")
+                print("LLM       WARNING= config/Modelfile not found, using defaults")
                 return True
             
             modelfile_content = modelfile_path.read_text().strip()
             if not modelfile_content:
-                self.log("warning", "config/Modelfile is empty, using defaults")
+                print("LLM       WARNING= config/Modelfile is empty, using defaults")
                 return True
             
             # Parse Modelfile format
@@ -142,69 +142,59 @@ class LLMService:
                             elif param_name == 'max_tokens':
                                 self.max_tokens = int(param_value)
                         except ValueError:
-                            self.log("warning", f"Invalid parameter value: {param_name}={param_value}")
+                            print(f"LLM       WARNING= Invalid parameter value: {param_name}={param_value}")
             
-            self.log("info", f"Modelfile parsed: model={self.model}", "modelfile_parsed")
+            print(f"LLM       INFO  = Modelfile parsed: model={self.model}")
             return True
             
         except Exception as e:
-            self.log("error", f"Failed to parse Modelfile: {e}")
+            print(f"LLM       ERROR = Failed to parse Modelfile: {e}")
             return False
     
-    def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
+    async def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
-        try:
-            # Add human-readable timestamp (dd-mm-yy HH:MM:SS format)
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%d-%m-%y %H:%M:%S")
+        payload = {
+            "svc": "LLM",
+            "level": level,
+            "message": message,
+        }
+        if event:
+            payload["event"] = event
+        if extra:
+            payload["extra"] = extra
             
-            payload = {
-                "svc": "LLM",
-                "level": level,
-                "message": message,
-            }
-            if event:
-                payload["event"] = event
-            if extra:
-                payload["extra"] = extra
-                
-            requests.post(f"{self.logger_url}/log", json=payload, timeout=2.0)
-        except Exception:
-            # Fallback to stdout if logger unavailable
-            print(f"LLM       {level.upper():<6}= {message}")
+        fallback_msg = f"LLM       {level.upper():<6}= {message}"
+        await safe_post(f"{self.logger_url}/log", json=payload, timeout=2.0, fallback_msg=fallback_msg)
     
-    def send_metric(self, metric: str, value: float, dialog_id: str = None):
+    async def send_metric(self, metric: str, value: float, dialog_id: str = None):
         """Send metric to Logger service"""
-        try:
-            payload = {
-                "svc": "LLM",
-                "metric": metric,
-                "value": value
-            }
-            if dialog_id:
-                payload["dialog_id"] = dialog_id
-                
-            requests.post(f"{self.logger_url}/metrics", json=payload, timeout=2.0)
-        except Exception:
-            pass
+        payload = {
+            "svc": "LLM",
+            "metric": metric,
+            "value": value
+        }
+        if dialog_id:
+            payload["dialog_id"] = dialog_id
+            
+        await safe_post(f"{self.logger_url}/metrics", json=payload, timeout=2.0, fallback_msg="")
     
-    def check_ollama_connection(self) -> bool:
+    async def check_ollama_connection(self) -> bool:
         """Check if Ollama is available"""
         try:
-            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=5.0)
-            return response.status_code == 200
+            data = await safe_get(f"{self.ollama_base_url}/api/tags", timeout=5.0)
+            return data is not None
         except Exception:
             return False
     
-    def ensure_model_available(self) -> bool:
+    async def ensure_model_available(self) -> bool:
         """Ensure the specified model is available in Ollama"""
         try:
             # Check if model exists
-            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=10.0)
-            if response.status_code != 200:
+            data = await safe_get(f"{self.ollama_base_url}/api/tags", timeout=10.0)
+            if not data:
                 return False
             
-            available_models = response.json().get("models", [])
+            available_models = data.get("models", [])
             model_names = [model.get("name", "") for model in available_models]
             
             # Check if our model is available
@@ -212,18 +202,19 @@ class LLMService:
                 return True
             
             # Try to pull the model if not available
-            self.log("info", f"Model {self.model} not found, attempting to pull...")
+            await self.log("info", f"Model {self.model} not found, attempting to pull...")
             
-            pull_response = requests.post(
+            pull_result = await safe_post(
                 f"{self.ollama_base_url}/api/pull",
                 json={"name": self.model},
-                timeout=300.0  # Model pulling can take a long time
+                timeout=300.0,  # Model pulling can take a long time
+                fallback_msg=""
             )
             
-            return pull_response.status_code == 200
+            return pull_result is not None
             
         except Exception as e:
-            self.log("error", f"Failed to ensure model availability: {e}")
+            await self.log("error", f"Failed to ensure model availability: {e}")
             return False
     
     async def warmup_model(self) -> bool:
@@ -232,7 +223,7 @@ class LLMService:
             return True
             
         try:
-            self.log("info", "Starting model warmup")
+            await self.log("info", "Starting model warmup")
             
             # Simple warmup request
             warmup_messages = [
@@ -252,34 +243,36 @@ class LLMService:
             
             start_time = time.time()
             
-            response = requests.post(
-                f"{self.ollama_base_url}/api/chat",
-                json=payload,
-                stream=True,
-                timeout=30.0
-            )
-            
-            if response.status_code == 200:
-                # Consume the stream to complete warmup
-                for line in response.iter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            if data.get("done", False):
-                                break
-                        except json.JSONDecodeError:
-                            continue
-                
-                warmup_time = (time.time() - start_time) * 1000
-                self.log("info", f"Model warmup completed in {warmup_time:.1f}ms")
-                self.send_metric("warmup_ms", warmup_time)
-                return True
-            else:
-                self.log("error", f"Model warmup failed: {response.status_code}")
-                return False
+            # Use httpx for streaming warmup request
+            import httpx
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.ollama_base_url}/api/chat",
+                    json=payload,
+                    timeout=30.0
+                ) as response:
+                    if response.status_code == 200:
+                        # Consume the stream to complete warmup
+                        async for line in response.aiter_lines():
+                            if line:
+                                try:
+                                    data = json.loads(line)
+                                    if data.get("done", False):
+                                        break
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                        warmup_time = (time.time() - start_time) * 1000
+                        await self.log("info", f"Model warmup completed in {warmup_time:.1f}ms")
+                        await self.send_metric("warmup_ms", warmup_time)
+                        return True
+                    else:
+                        await self.log("error", f"Model warmup failed: {response.status_code}")
+                        return False
                 
         except Exception as e:
-            self.log("error", f"Model warmup error: {e}")
+            await self.log("error", f"Model warmup error: {e}")
             return False
     
     def build_chat_messages(self, user_text: str, history: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, str]]:
@@ -305,7 +298,16 @@ class LLMService:
         
         try:
             self.active_streams += 1
-            self.log("info", f"Starting completion stream for dialog {request.dialog_id}", "stream_started")
+            # Use asyncio bridge for logging from async generator
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    self.log("info", f"Starting completion stream for dialog {request.dialog_id}", "stream_started"),
+                    loop
+                )
+            except:
+                print(f"LLM       INFO  = Starting completion stream for dialog {request.dialog_id}")
             
             # Build messages
             messages = self.build_chat_messages(request.text, request.history)
@@ -331,57 +333,92 @@ class LLMService:
                 "options": options
             }
             
-            # Start streaming request to Ollama
-            response = requests.post(
-                f"{self.ollama_base_url}/api/chat",
-                json=payload,
-                stream=True,
-                timeout=self.request_timeout_s
-            )
-            
-            if response.status_code != 200:
-                self.log("error", f"Ollama request failed: {response.status_code}")
-                yield f"Error: Failed to get response from language model"
-                return
-            
-            # Stream response chunks
-            for line in response.iter_lines():
-                if line:
-                    try:
-                        data = json.loads(line)
-                        
-                        # Extract content from response
-                        if "message" in data and "content" in data["message"]:
-                            content = data["message"]["content"]
-                            
-                            if content:
-                                # Track first token time
-                                if first_token_time is None:
-                                    first_token_time = time.time()
-                                    ttft = (first_token_time - start_time) * 1000
-                                    self.send_metric("ttft_ms", ttft, request.dialog_id)
+            # Start streaming request to Ollama using httpx
+            import httpx
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.ollama_base_url}/api/chat",
+                    json=payload,
+                    timeout=self.request_timeout_s
+                ) as response:
+                    
+                    if response.status_code != 200:
+                        try:
+                            loop = asyncio.get_event_loop()
+                            asyncio.run_coroutine_threadsafe(
+                                self.log("error", f"Ollama request failed: {response.status_code}"),
+                                loop
+                            )
+                        except:
+                            print(f"LLM       ERROR = Ollama request failed: {response.status_code}")
+                        yield f"Error: Failed to get response from language model"
+                        return
+                    
+                    # Stream response chunks
+                    async for line in response.aiter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
                                 
-                                token_count += 1
-                                yield content
-                        
-                        # Check if done
-                        if data.get("done", False):
-                            break
-                            
-                    except json.JSONDecodeError:
-                        continue
+                                # Extract content from response
+                                if "message" in data and "content" in data["message"]:
+                                    content = data["message"]["content"]
+                                    
+                                    if content:
+                                        # Track first token time
+                                        if first_token_time is None:
+                                            first_token_time = time.time()
+                                            ttft = (first_token_time - start_time) * 1000
+                                            try:
+                                                loop = asyncio.get_event_loop()
+                                                asyncio.run_coroutine_threadsafe(
+                                                    self.send_metric("ttft_ms", ttft, request.dialog_id),
+                                                    loop
+                                                )
+                                            except:
+                                                pass
+                                        
+                                        token_count += 1
+                                        yield content
+                                
+                                # Check if done
+                                if data.get("done", False):
+                                    break
+                                    
+                            except json.JSONDecodeError:
+                                continue
             
             # Calculate and log metrics
             total_time = time.time() - start_time
             if token_count > 0 and total_time > 0:
                 tokens_per_sec = token_count / total_time
-                self.send_metric("tokens_total", float(token_count), request.dialog_id)
-                self.send_metric("tokens_sec", tokens_per_sec, request.dialog_id)
-            
-            self.log("info", f"Completion stream ended: {token_count} tokens in {total_time:.2f}s", "stream_ended")
+                try:
+                    loop = asyncio.get_event_loop()
+                    asyncio.run_coroutine_threadsafe(
+                        self.send_metric("tokens_total", float(token_count), request.dialog_id),
+                        loop
+                    )
+                    asyncio.run_coroutine_threadsafe(
+                        self.send_metric("tokens_sec", tokens_per_sec, request.dialog_id),
+                        loop
+                    )
+                    asyncio.run_coroutine_threadsafe(
+                        self.log("info", f"Completion stream ended: {token_count} tokens in {total_time:.2f}s", "stream_ended"),
+                        loop
+                    )
+                except:
+                    print(f"LLM       INFO  = Completion stream ended: {token_count} tokens in {total_time:.2f}s")
             
         except Exception as e:
-            self.log("error", f"Streaming error: {e}")
+            try:
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    self.log("error", f"Streaming error: {e}"),
+                    loop
+                )
+            except:
+                print(f"LLM       ERROR = Streaming error: {e}")
             yield f"Error: {str(e)}"
         finally:
             self.active_streams -= 1
@@ -389,42 +426,42 @@ class LLMService:
     async def startup(self):
         """Service startup logic"""
         try:
-            self.log("info", "LLM service starting", "service_start")
+            await self.log("info", "LLM service starting", "service_start")
             
             # Check Ollama connection
-            if not self.check_ollama_connection():
-                self.log("error", "Ollama not available")
+            if not await self.check_ollama_connection():
+                await self.log("error", "Ollama not available")
                 self.state = LLMState.ERROR
                 return False
             
-            self.log("info", "Connected to Ollama", "ollama_connected")
+            await self.log("info", "Connected to Ollama", "ollama_connected")
             
             # Ensure model is available
-            if not self.ensure_model_available():
-                self.log("error", f"Model {self.model} not available")
+            if not await self.ensure_model_available():
+                await self.log("error", f"Model {self.model} not available")
                 self.state = LLMState.ERROR
                 return False
             
             # Perform warmup if enabled
             if not await self.warmup_model():
-                self.log("warning", "Model warmup failed, continuing anyway")
+                await self.log("warning", "Model warmup failed, continuing anyway")
             
             self.state = LLMState.READY
-            self.log("info", "LLM service ready", "service_ready")
+            await self.log("info", "LLM service ready", "service_ready")
             return True
             
         except Exception as e:
-            self.log("error", f"LLM startup failed: {e}")
+            await self.log("error", f"LLM startup failed: {e}")
             self.state = LLMState.ERROR
             return False
     
     async def shutdown(self):
         """Service shutdown logic"""
-        self.log("info", "LLM service shutting down")
+        await self.log("info", "LLM service shutting down")
         
         # Wait for active streams to complete
         if self.active_streams > 0:
-            self.log("info", f"Waiting for {self.active_streams} active streams to complete")
+            await self.log("info", f"Waiting for {self.active_streams} active streams to complete")
             # Give streams time to complete gracefully
             await asyncio.sleep(2.0)
 
@@ -434,9 +471,11 @@ llm_service = LLMService()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def service_lifespan():
     # Startup
-    await llm_service.startup()
+    success = await llm_service.startup()
+    if not success:
+        raise RuntimeError("LLM service startup failed")
     yield
     # Shutdown
     await llm_service.shutdown()
@@ -447,7 +486,7 @@ app = FastAPI(
     title="LLM Service",
     description="Streaming Language Model Completions via Ollama",
     version="1.0",
-    lifespan=lifespan
+    lifespan=lambda app: lifespan_with_httpx(service_lifespan)
 )
 
 
