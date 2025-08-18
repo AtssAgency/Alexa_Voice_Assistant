@@ -3,13 +3,17 @@
 KWD Service - Wake Word Detection using openWakeWord
 
 FastAPI service on port 5002 that:
-- Continuously listens for "Alexa" wake word using openWakeWord
-- Adapts sensitivity based on ambient noise from RMS service
+- Continuously listens for wake words using openWakeWord (ONNX model path configurable)
+- Adapts sensitivity based on ambient noise from RMS service (optional)
 - Triggers TTS confirmation and STT dialog on detection
-- Manages state: INIT → READY → ACTIVE → TRIGGERED → SLEEP
-- Handles loader greeting and STT re-arming
+- Manages state: INIT → READY → ACTIVE → TRIGGERED → SLEEP → ACTIVE
+- Provides endpoints for loader coordination and basic diagnostics
 
-State flow: INIT → READY → ACTIVE → TRIGGERED → SLEEP → ACTIVE (cycle)
+Notes:
+- Audio is captured @16 kHz, mono, int16. Detector expects int16 PCM.
+- Chunking uses 80 ms windows (1280 samples) as recommended for stable streaming features.
+- Includes basic DC-block (one-pole high-pass) and RMS gating to avoid “dead mic” noise.
+- Device selection is configurable via [audio] section.
 """
 
 import os
@@ -18,10 +22,8 @@ import time
 import threading
 import random
 import uuid
-import asyncio
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import configparser
 
 import numpy as np
@@ -32,14 +34,17 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 
+# --- Third-party wake word model ---
 try:
-    import openwakeword
     from openwakeword.model import Model
 except ImportError:
-    print("ERROR: openwakeword not installed. Run: pip install openwakeword")
+    print("ERROR: openwakeword not installed. Try: uv add openwakeword sounddevice")
     sys.exit(1)
 
 
+# -----------------------------
+# Constants / State
+# -----------------------------
 class KWDState:
     INIT = "INIT"
     READY = "READY"
@@ -48,7 +53,9 @@ class KWDState:
     SLEEP = "SLEEP"
 
 
-# Request/Response Models
+# -----------------------------
+# Models
+# -----------------------------
 class StartRequest(BaseModel):
     dialog_id: Optional[str] = None
 
@@ -75,498 +82,596 @@ class STTStartRequest(BaseModel):
     dialog_id: str
 
 
+# -----------------------------
+# Service
+# -----------------------------
 class KWDService:
     def __init__(self):
+        # State
         self.state = KWDState.INIT
+
+        # Config
         self.config: Optional[configparser.ConfigParser] = None
-        
-        # Service URLs
-        self.logger_url = "http://127.0.0.1:5000"
-        self.rms_url = "http://127.0.0.1:5006"
-        self.tts_url = "http://127.0.0.1:5005"
-        self.stt_url = "http://127.0.0.1:5003"
-        
-        # Configuration
+
+        # Ports / URLs (bases + routes; backwards compatible with full URLs in base)
         self.port = 5002
+        self.logger_base = "http://127.0.0.1:5000"
+        self.rms_base = "http://127.0.0.1:5006"
+        self.tts_base = "http://127.0.0.1:5005"  # may already include path in older configs
+        self.stt_base = "http://127.0.0.1:5003"  # may already include path in older configs
+
+        # Routes (can be empty; if base already has a path, we won't append)
+        self.logger_route = "/log"
+        self.rms_route = "/current-rms"
+        self.tts_route = "/speak"
+        self.stt_route = "/start"
+
+        # Wake word
         self.model_path = "models/alexa_v0.1.onnx"
-        self.base_rms_threshold = 0.050
-        self.cooldown_ms = 1000
-        self.yes_phrases = ["Yes?", "Yes Master?", "What's up?", "I'm listening", "Yo", "Here!"]
-        self.greeting_text = "Hi Master. Ready to serve."
-        
-        # Adaptive thresholding
-        self.quiet_dbfs = -60
-        self.noisy_dbfs = -35
+
+        # Thresholding (base sensitivity and adaptive multipliers)
+        self.base_threshold = 0.50
+        self.current_threshold = self.base_threshold
+        self.quiet_dbfs = -60.0
+        self.noisy_dbfs = -35.0
         self.quiet_factor = 0.80
         self.noisy_factor = 1.25
-        
+
+        # Cooldown
+        self.cooldown_ms = 1000
+        self.last_detection_time = 0.0
+        self.detection_lock = threading.Lock()
+
         # Audio settings
         self.sample_rate = 16000
-        self.chunk_size = 1280  # 80ms at 16kHz
-        
+        self.frame_ms = 80  # window size for detector
+        self.chunk_size = int(self.sample_rate * self.frame_ms / 1000)  # 1280
+        self.audio_device: Optional[int] = None  # device index or None (default)
+
+        # Audio stream + buffer (int16)
+        self.audio_stream: Optional[sd.InputStream] = None
+        self.audio_buffer: List[int] = []
+        self.buffer_lock = threading.Lock()
+
+        # DC-block (simple one-pole high-pass)
+        self.hp_enabled = True
+        self.hp_prev_x = 0.0
+        self.hp_prev_y = 0.0
+        self.hp_alpha = 0.995  # ~50–70 Hz corner @16k
+
+        # RMS gating for “dead mic” frames
+        self.min_frame_rms = 50  # int16 scale
+
         # Wake word engine
         self.detector: Optional[Model] = None
         self.detection_thread: Optional[threading.Thread] = None
-        self.audio_stream: Optional[sd.InputStream] = None
         self.stop_event = threading.Event()
-        
-        # State management
-        self.current_threshold = self.base_rms_threshold
-        self.last_detection_time = 0
-        self.detection_lock = threading.Lock()
-        
-        # Audio buffer
-        self.audio_buffer = []
-        self.buffer_lock = threading.Lock()
-    
+
+        # Phrases
+        self.yes_phrases = ["Yes?", "Yes Master?", "What's up?", "I'm listening", "Yo", "Here!"]
+        self.greeting_text = "Hi Master. Ready to serve."
+
+        # Adaptive update timer
+        self._last_thr_update = 0.0
+        self._thr_update_interval_s = 5.0
+
+    # -----------------------------
+    # URL helpers (fix for 404 regression)
+    # -----------------------------
+    @staticmethod
+    def _compose_url(base: str, route: str) -> str:
+        """
+        Backward-compatible URL joiner:
+        - If route is absolute (starts with http), return route.
+        - If base already ends with the same route, return base.
+        - If base already includes a path (e.g., .../speak) and route == '/speak', don't duplicate.
+        - Else join cleanly.
+        """
+        if not base:
+            return route or ""
+        if route and route.startswith("http"):
+            return route
+
+        base_clean = base.rstrip("/")
+        route_clean = (route or "").lstrip("/")
+
+        # If base already contains a path and ends with route, don't append
+        if route_clean and base_clean.split("://")[-1].rstrip("/").endswith(route_clean):
+            return base_clean
+
+        # If route empty, use base as-is
+        if not route_clean:
+            return base_clean
+
+        return f"{base_clean}/{route_clean}"
+
+    def _url_logger(self) -> str:
+        return self._compose_url(self.logger_base, self.logger_route)
+
+    def _url_rms(self) -> str:
+        return self._compose_url(self.rms_base, self.rms_route)
+
+    def _url_tts(self) -> str:
+        return self._compose_url(self.tts_base, self.tts_route)
+
+    def _url_stt(self) -> str:
+        return self._compose_url(self.stt_base, self.stt_route)
+
+    # -----------------------------
+    # Config / Logging
+    # -----------------------------
     def load_config(self) -> bool:
-        """Load configuration from config/config.ini"""
+        """Load configuration from config/config.ini (non-fatal: falls back to defaults)."""
         try:
-            config_path = Path("config/config.ini")
-            if not config_path.exists():
+            cfg_path = Path("config/config.ini")
+            if not cfg_path.exists():
                 self.log("warning", "config/config.ini not found, using defaults")
                 return True
-                
-            self.config = configparser.ConfigParser()
-            self.config.read(config_path)
-            
-            # Load KWD section
-            if 'kwd' in self.config:
-                kwd_section = self.config['kwd']
-                self.model_path = kwd_section.get('model_path', self.model_path)
-                self.base_rms_threshold = kwd_section.getfloat('base_rms_threshold', self.base_rms_threshold)
-                self.cooldown_ms = kwd_section.getint('cooldown_ms', self.cooldown_ms)
-                
-                yes_phrases_str = kwd_section.get('yes_phrases', ', '.join(self.yes_phrases))
-                self.yes_phrases = [p.strip() for p in yes_phrases_str.split(',')]
-                
-                self.greeting_text = kwd_section.get('greeting_text', self.greeting_text)
-                self.port = kwd_section.getint('port', self.port)
-            
-            # Load adaptive section
-            if 'kwd.adaptive' in self.config:
-                adaptive_section = self.config['kwd.adaptive']
-                self.quiet_dbfs = adaptive_section.getfloat('quiet_dbfs', self.quiet_dbfs)
-                self.noisy_dbfs = adaptive_section.getfloat('noisy_dbfs', self.noisy_dbfs)
-                self.quiet_factor = adaptive_section.getfloat('quiet_factor', self.quiet_factor)
-                self.noisy_factor = adaptive_section.getfloat('noisy_factor', self.noisy_factor)
-            
-            # Load dependency URLs
-            if 'kwd.deps' in self.config:
-                deps_section = self.config['kwd.deps']
-                self.logger_url = deps_section.get('logger_url', self.logger_url)
-                self.tts_url = deps_section.get('tts_url', self.tts_url)
-                self.stt_url = deps_section.get('stt_url', self.stt_url)
-                self.rms_url = deps_section.get('rms_url', self.rms_url)
-            
+
+            cfg = configparser.ConfigParser()
+            cfg.read(cfg_path)
+            self.config = cfg
+
+            # [kwd]
+            if "kwd" in cfg:
+                s = cfg["kwd"]
+                self.model_path = s.get("model_path", self.model_path)
+                self.base_threshold = s.getfloat("base_threshold", self.base_threshold)
+                self.current_threshold = self.base_threshold
+                self.cooldown_ms = s.getint("cooldown_ms", self.cooldown_ms)
+                self.port = s.getint("port", self.port)
+                yes_phrases_str = s.get("yes_phrases", ", ".join(self.yes_phrases))
+                self.yes_phrases = [p.strip() for p in yes_phrases_str.split(",")]
+                self.greeting_text = s.get("greeting_text", self.greeting_text)
+
+            # [kwd.adaptive]
+            if "kwd.adaptive" in cfg:
+                s = cfg["kwd.adaptive"]
+                self.quiet_dbfs = s.getfloat("quiet_dbfs", self.quiet_dbfs)
+                self.noisy_dbfs = s.getfloat("noisy_dbfs", self.noisy_dbfs)
+                self.quiet_factor = s.getfloat("quiet_factor", self.quiet_factor)
+                self.noisy_factor = s.getfloat("noisy_factor", self.noisy_factor)
+
+            # [kwd.deps]
+            if "kwd.deps" in cfg:
+                s = cfg["kwd.deps"]
+                # Bases (may include full paths from older configs)
+                self.logger_base = s.get("logger_url", self.logger_base)
+                self.rms_base = s.get("rms_url", self.rms_base)
+                self.tts_base = s.get("tts_url", self.tts_base)   # keep backward compatibility
+                self.stt_base = s.get("stt_url", self.stt_base)   # keep backward compatibility
+                # Optional routes (empty allowed)
+                self.logger_route = s.get("logger_route", self.logger_route)
+                self.rms_route = s.get("rms_route", self.rms_route)
+                self.tts_route = s.get("tts_route", self.tts_route)
+                self.stt_route = s.get("stt_route", self.stt_route)
+
+            # [audio]
+            if "audio" in cfg:
+                s = cfg["audio"]
+                if s.get("device_index", "").strip():
+                    try:
+                        self.audio_device = int(s.get("device_index"))
+                    except ValueError:
+                        self.audio_device = None
+                else:
+                    self.audio_device = None
+                self.sample_rate = s.getint("sample_rate", self.sample_rate)
+                self.frame_ms = s.getint("frame_ms", self.frame_ms)
+                self.chunk_size = int(self.sample_rate * self.frame_ms / 1000)
+                self.min_frame_rms = s.getint("min_frame_rms", self.min_frame_rms)
+                self.hp_enabled = s.getboolean("dc_block", self.hp_enabled)
+
             return True
         except Exception as e:
             self.log("error", f"Failed to load config: {e}")
             return False
-    
+
     def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
-        """Send log message to Logger service"""
+        """Send structured log to Logger or fallback to stdout."""
         try:
-            # Add human-readable timestamp (dd-mm-yy HH:MM:SS format)
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%d-%m-%y %H:%M:%S")
-            
-            payload = {
-                "svc": "KWD",
-                "level": level,
-                "message": message,
-            }
+            payload = {"svc": "KWD", "level": level, "message": message}
             if event:
                 payload["event"] = event
             if extra:
                 payload["extra"] = extra
-                
-            requests.post(f"{self.logger_url}/log", json=payload, timeout=2.0)
+            requests.post(self._url_logger(), json=payload, timeout=1.5)
         except Exception:
-            # Fallback to stdout if logger unavailable
             print(f"KWD       {level.upper():<6}= {message}")
-    
-    def get_current_rms(self) -> Optional[float]:
-        """Get current RMS noise level from RMS service"""
+
+    # -----------------------------
+    # RMS → Adaptive threshold
+    # -----------------------------
+    def get_current_rms_dbfs(self) -> Optional[float]:
+        """Query RMS service (optional)."""
         try:
-            # rms_url from config already includes the endpoint (/current-rms)
-            response = requests.get(self.rms_url, timeout=2.0)
-            if response.status_code == 200:
-                data = response.json()
+            r = requests.get(self._url_rms(), timeout=1.0)
+            if r.status_code == 200:
+                data = r.json()
                 return data.get("rms_dbfs")
         except Exception as e:
-            self.log("debug", f"Failed to get RMS: {e}")
+            self.log("debug", f"RMS query failed: {e}")
         return None
-    
-    def calculate_adaptive_threshold(self, noise_dbfs: float) -> float:
-        """Calculate adaptive threshold based on ambient noise"""
+
+    def _interp_factor(self, noise_dbfs: float) -> float:
         if noise_dbfs <= self.quiet_dbfs:
-            factor = self.quiet_factor
-        elif noise_dbfs >= self.noisy_dbfs:
-            factor = self.noisy_factor
-        else:
-            # Linear interpolation between quiet and noisy
-            ratio = (noise_dbfs - self.quiet_dbfs) / (self.noisy_dbfs - self.quiet_dbfs)
-            factor = self.quiet_factor + ratio * (self.noisy_factor - self.quiet_factor)
-        
-        return self.base_rms_threshold * factor
-    
+            return self.quiet_factor
+        if noise_dbfs >= self.noisy_dbfs:
+            return self.noisy_factor
+        ratio = (noise_dbfs - self.quiet_dbfs) / (self.noisy_dbfs - self.quiet_dbfs)
+        return self.quiet_factor + ratio * (self.noisy_factor - self.quiet_factor)
+
     def update_threshold_from_rms(self):
-        """Update detection threshold based on current RMS"""
-        rms_dbfs = self.get_current_rms()
-        if rms_dbfs is not None:
-            new_threshold = self.calculate_adaptive_threshold(rms_dbfs)
-            if abs(new_threshold - self.current_threshold) > 0.005:  # Avoid noise
-                self.current_threshold = new_threshold
-                self.log("debug", f"Adaptive threshold updated: {self.current_threshold:.3f} (RMS: {rms_dbfs:.1f} dBFS)")
-    
+        """Recalculate detector threshold from ambient noise."""
+        rms_dbfs = self.get_current_rms_dbfs()
+        if rms_dbfs is None:
+            return
+        new_thr = self.base_threshold * self._interp_factor(rms_dbfs)
+        if abs(new_thr - self.current_threshold) >= 0.01:
+            self.current_threshold = float(np.clip(new_thr, 0.05, 0.99))
+            self.log(
+                "debug",
+                f"Adaptive threshold → {self.current_threshold:.3f} (RMS {rms_dbfs:.1f} dBFS)",
+            )
+
+    # -----------------------------
+    # Model / Audio
+    # -----------------------------
     def load_wake_word_model(self) -> bool:
-        """Load the openWakeWord model"""
         try:
             model_file = Path(self.model_path)
             if not model_file.exists():
                 self.log("error", f"Wake word model not found: {self.model_path}")
                 return False
-            
+
             self.log("info", f"Loading wake word model: {self.model_path}")
-            # Initialize the detector with the single ONNX model
             self.detector = Model(wakeword_model_paths=[str(model_file)])
-            
-            self.log("info", "Wake word model loaded successfully", "model_loaded")
+            self.log("info", "Wake word model loaded", "model_loaded")
             return True
-            
         except Exception as e:
-            self.log("error", f"Failed to load wake word model: {e}")
+            self.log("error", f"Model load failed: {e}")
             return False
-    
+
+    def _dc_block(self, x: np.ndarray) -> np.ndarray:
+        if not self.hp_enabled:
+            return x
+        # y[n] = x[n] - x[n-1] + a * y[n-1]
+        y = np.empty_like(x, dtype=np.float32)
+        prev_x = self.hp_prev_x
+        prev_y = self.hp_prev_y
+        a = self.hp_alpha
+        xf = x.astype(np.float32)
+        for i in range(len(xf)):
+            y_i = xf[i] - prev_x + a * prev_y
+            prev_x = xf[i]
+            prev_y = y_i
+            y[i] = y_i
+        self.hp_prev_x = float(prev_x)
+        self.hp_prev_y = float(prev_y)
+        y = np.clip(y, -32768.0, 32767.0)
+        return y.astype(np.int16)
+
     def audio_callback(self, indata, frames, time_info, status):
-        """Audio input callback"""
+        """Audio capture callback → accumulate int16 samples."""
         if status:
             self.log("warning", f"Audio callback status: {status}")
-            
-        # Convert to float32 and add to buffer
-        audio_data = indata[:, 0].astype(np.float32)
-        
+
+        pcm = indata
+        if pcm.ndim == 2:
+            pcm = pcm[:, 0]
+        if pcm.dtype != np.int16:
+            pf = pcm.astype(np.float32)
+            pf = np.clip(pf, -1.0, 1.0)
+            pcm16 = (pf * 32767.0).astype(np.int16)
+        else:
+            pcm16 = pcm
+
+        pcm16 = self._dc_block(pcm16)
+
         with self.buffer_lock:
-            self.audio_buffer.extend(audio_data)
-            
-            # Keep buffer size reasonable (2 seconds max)
-            max_buffer_size = self.sample_rate * 2
-            if len(self.audio_buffer) > max_buffer_size:
-                self.audio_buffer = self.audio_buffer[-max_buffer_size:]
-    
+            self.audio_buffer.extend(pcm16.tolist())
+            max_len = self.sample_rate * 2  # keep ~2 seconds max
+            if len(self.audio_buffer) > max_len:
+                self.audio_buffer = self.audio_buffer[-max_len:]
+
     def start_audio_stream(self) -> bool:
-        """Start audio input stream"""
+        """Open sounddevice.InputStream with desired device/index."""
         try:
             self.audio_stream = sd.InputStream(
+                device=self.audio_device,
                 samplerate=self.sample_rate,
                 channels=1,
+                dtype="int16",
                 callback=self.audio_callback,
-                blocksize=self.chunk_size,
-                dtype=np.float32
+                blocksize=self.chunk_size,  # 80 ms chunks
             )
             self.audio_stream.start()
-            self.log("info", "Audio stream started")
+            self.log("info", f"Audio stream started (device={self.audio_device}, fs={self.sample_rate})")
             return True
         except Exception as e:
             self.log("error", f"Failed to start audio stream: {e}")
             return False
-    
+
     def stop_audio_stream(self):
-        """Stop audio input stream"""
         if self.audio_stream:
             try:
                 self.audio_stream.stop()
                 self.audio_stream.close()
-                self.audio_stream = None
-                self.log("info", "Audio stream stopped")
             except Exception as e:
                 self.log("warning", f"Error stopping audio stream: {e}")
-    
+            finally:
+                self.audio_stream = None
+                self.log("info", "Audio stream stopped")
+
+    # -----------------------------
+    # Detection Loop
+    # -----------------------------
     def detection_worker(self):
-        """Main detection thread worker"""
         self.log("info", "Detection worker started")
-        
         while not self.stop_event.is_set():
             try:
                 if self.state != KWDState.ACTIVE:
                     time.sleep(0.1)
                     continue
-                
-                # Get audio data from buffer
+
+                # Pull a frame
                 with self.buffer_lock:
                     if len(self.audio_buffer) < self.chunk_size:
-                        time.sleep(0.01)
-                        continue
-                    
-                    # Get chunk and remove from buffer
-                    audio_chunk = np.array(self.audio_buffer[:self.chunk_size])
-                    self.audio_buffer = self.audio_buffer[self.chunk_size:]
-                
-                # Process with wake word detector
+                        frame = None
+                    else:
+                        frame = np.array(self.audio_buffer[:self.chunk_size], dtype=np.int16)
+                        self.audio_buffer = self.audio_buffer[self.chunk_size:]
+
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                # Frame gating by RMS (dead mic / wrong source)
+                rms = int(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                if rms < self.min_frame_rms:
+                    continue
+
+                # Run prediction
                 if self.detector:
-                    predictions = self.detector.predict(audio_chunk)
-                    
-                    # Check for wake word detection
+                    predictions = self.detector.predict(frame)
                     for model_name, score in predictions.items():
                         if score >= self.current_threshold:
-                            self.handle_wake_detection(score)
+                            self.handle_wake_detection(float(score))
                             break
-                
-                # Update adaptive threshold periodically
-                if time.time() % 5 < 0.1:  # Every ~5 seconds
+
+                # Adaptive threshold every ~5s
+                now = time.time()
+                if now - self._last_thr_update > self._thr_update_interval_s:
                     self.update_threshold_from_rms()
-                    
+                    self._last_thr_update = now
+
             except Exception as e:
                 self.log("error", f"Detection worker error: {e}")
-                time.sleep(0.1)
-        
+                time.sleep(0.05)
+
         self.log("info", "Detection worker stopped")
-    
+
     def handle_wake_detection(self, confidence: float):
-        """Handle wake word detection"""
-        current_time = time.time()
-        
+        now = time.time()
         with self.detection_lock:
-            # Check cooldown
-            if (current_time - self.last_detection_time) * 1000 < self.cooldown_ms:
+            if (now - self.last_detection_time) * 1000 < self.cooldown_ms:
                 return
-            
-            self.last_detection_time = current_time
-        
-        # State transition: ACTIVE → TRIGGERED → SLEEP
+            self.last_detection_time = now
+
         self.state = KWDState.TRIGGERED
-        self.log("info", f"Wake word detected (confidence {confidence:.3f})", "wake_detected", 
-                {"confidence": confidence, "threshold": self.current_threshold})
-        
-        # Generate dialog ID
+        self.log(
+            "info",
+            f"Wake word detected (score={confidence:.3f}, thr={self.current_threshold:.3f})",
+            "wake_detected",
+            {"score": confidence, "threshold": self.current_threshold},
+        )
+
         dialog_id = f"dialog_{uuid.uuid4().hex[:8]}"
-        
-        # Immediately transition to SLEEP to prevent double-triggering
+
+        # Move to SLEEP so we don't double-trigger while TTS/STT spin up
         self.state = KWDState.SLEEP
-        
-        # Start cooldown timer (will transition back to ACTIVE)
-        threading.Thread(target=self.cooldown_timer, daemon=True).start()
-        
-        # Trigger side effects asynchronously
-        self.trigger_tts_confirmation(dialog_id)
-        self.trigger_stt_dialog(dialog_id)
-    
-    def cooldown_timer(self):
-        """Cooldown timer to transition from SLEEP back to ACTIVE"""
+        threading.Thread(target=self._cooldown_reattach, daemon=True).start()
+
+        # Fire-and-forget side effects
+        threading.Thread(target=self.trigger_tts_confirmation, args=(dialog_id,), daemon=True).start()
+        threading.Thread(target=self.trigger_stt_dialog, args=(dialog_id,), daemon=True).start()
+
+    def _cooldown_reattach(self):
         time.sleep(self.cooldown_ms / 1000.0)
         if self.state == KWDState.SLEEP:
             self.state = KWDState.ACTIVE
-            self.log("debug", "Cooldown completed, re-armed to ACTIVE")
-    
+            self.log("debug", "Cooldown done → ACTIVE")
+
+    # -----------------------------
+    # Side Effects: TTS / STT
+    # -----------------------------
     def trigger_tts_confirmation(self, dialog_id: str):
-        """Send confirmation phrase to TTS"""
+        phrase = random.choice(self.yes_phrases)
+        url = self._url_tts()
         try:
-            phrase = random.choice(self.yes_phrases)
-            payload = TTSSpeakRequest(text=phrase, dialog_id=dialog_id)
-            
-            # tts_url from config already includes the endpoint (/speak)
-            response = requests.post(self.tts_url, 
-                                   json=payload.dict(), timeout=5.0)
-            
-            if response.status_code == 200:
-                self.log("debug", f"TTS confirmation sent: '{phrase}'", "tts_called")
+            payload = TTSSpeakRequest(text=phrase, dialog_id=dialog_id).dict()
+            r = requests.post(url, json=payload, timeout=8.0)
+            if r.status_code == 200:
+                self.log("debug", f"TTS confirmation sent: {phrase}", "tts_called", {"url": url})
             else:
-                self.log("warning", f"TTS confirmation failed: {response.status_code}")
-                
+                self.log("warning", f"TTS confirmation failed: {r.status_code}", extra={"url": url, "body": r.text})
         except Exception as e:
-            self.log("warning", f"TTS confirmation error: {e}")
-    
+            self.log("warning", f"TTS confirmation error: {e}", extra={"url": url})
+
     def trigger_stt_dialog(self, dialog_id: str):
-        """Start STT dialog session"""
+        url = self._url_stt()
         try:
-            payload = STTStartRequest(dialog_id=dialog_id)
-            
-            # stt_url from config already includes the endpoint (/start)
-            response = requests.post(self.stt_url, 
-                                   json=payload.dict(), timeout=5.0)
-            
-            if response.status_code == 200:
-                self.log("info", f"STT dialog started: {dialog_id}", "stt_started")
+            payload = STTStartRequest(dialog_id=dialog_id).dict()
+            r = requests.post(url, json=payload, timeout=8.0)
+            if r.status_code == 200:
+                self.log("info", f"STT dialog started: {dialog_id}", "stt_started", {"url": url})
             else:
-                self.log("warning", f"STT start failed: {response.status_code}")
-                
+                self.log("warning", f"STT start failed: {r.status_code}", extra={"url": url, "body": r.text})
         except Exception as e:
-            self.log("warning", f"STT start error: {e}")
-    
+            self.log("warning", f"STT start error: {e}", extra={"url": url})
+
+    # -----------------------------
+    # Start/Stop
+    # -----------------------------
     def start_detection(self) -> bool:
-        """Start wake word detection"""
         if self.state == KWDState.INIT:
             return False
-            
         if self.detection_thread and self.detection_thread.is_alive():
-            return True  # Already running
-            
-        try:
-            # Start audio stream
-            if not self.start_audio_stream():
-                return False
-            
-            # Start detection thread
-            self.stop_event.clear()
-            self.detection_thread = threading.Thread(target=self.detection_worker, daemon=True)
-            self.detection_thread.start()
-            
-            self.state = KWDState.ACTIVE
-            self.log("info", "Wake word detection started", "kwd_started")
             return True
-            
-        except Exception as e:
-            self.log("error", f"Failed to start detection: {e}")
+
+        if not self.start_audio_stream():
             return False
-    
+
+        self.stop_event.clear()
+        self.detection_thread = threading.Thread(target=self.detection_worker, daemon=True)
+        self.detection_thread.start()
+        self.state = KWDState.ACTIVE
+        self.log("info", "Wake word detection started", "kwd_started")
+        return True
+
     def stop_detection(self):
-        """Stop wake word detection"""
         self.state = KWDState.SLEEP
         self.stop_event.set()
-        
-        # Stop audio stream
         self.stop_audio_stream()
-        
-        # Wait for thread to finish
         if self.detection_thread and self.detection_thread.is_alive():
-            self.detection_thread.join(timeout=2.0)
-        
+            self.detection_thread.join(timeout=1.5)
         self.log("info", "Wake word detection stopped", "kwd_stopped")
-    
+
     def play_greeting_and_activate(self):
-        """Play system ready greeting and transition to ACTIVE"""
+        """Say greeting, then arm detection (even if TTS fails)."""
+        url = self._url_tts()
         try:
-            # Send greeting to TTS
-            payload = TTSSpeakRequest(text=self.greeting_text)
-            # tts_url from config already includes the endpoint (/speak)
-            response = requests.post(self.tts_url, 
-                                   json=payload.dict(), timeout=10.0)
-            
-            if response.status_code == 200:
-                self.log("info", f"Greeting played: '{self.greeting_text}'", "greeting_played")
-                
-                # Wait a moment for greeting to start, then activate
+            payload = TTSSpeakRequest(text=self.greeting_text).dict()
+            r = requests.post(url, json=payload, timeout=8.0)
+            if r.status_code == 200:
+                self.log("info", f"Greeting played: '{self.greeting_text}'", "greeting_played", {"url": url})
                 time.sleep(0.5)
-                self.start_detection()
             else:
-                self.log("warning", f"Greeting TTS failed: {response.status_code}")
-                # Still activate even if greeting fails
-                self.start_detection()
-                
+                self.log("warning", f"Greeting TTS failed: {r.status_code}", extra={"url": url, "body": r.text})
         except Exception as e:
-            self.log("warning", f"Greeting error: {e}")
-            # Still activate even if greeting fails
+            self.log("warning", f"Greeting error: {e}", extra={"url": url})
+        finally:
             self.start_detection()
-    
-    async def startup(self):
-        """Service startup logic"""
+
+    # -----------------------------
+    # Lifecycle
+    # -----------------------------
+    async def startup(self) -> bool:
         try:
             self.log("info", "KWD service starting", "service_start")
-            
-            # Load configuration
             if not self.load_config():
-                self.log("error", "Failed to load configuration")
+                self.log("error", "Configuration load failed")
                 return False
-            
-            # Load wake word model
             if not self.load_wake_word_model():
-                self.log("error", "Failed to load wake word model")
+                self.log("error", "Wake word model load failed")
                 return False
-            
             self.state = KWDState.READY
             self.log("info", "KWD service ready", "service_ready")
             return True
-            
         except Exception as e:
             self.log("error", f"KWD startup failed: {e}")
             return False
-    
+
     async def shutdown(self):
-        """Service shutdown logic"""
         self.log("info", "KWD service shutting down")
         self.stop_detection()
 
+    # -----------------------------
+    # Diagnostics
+    # -----------------------------
+    def list_input_devices(self) -> List[Dict[str, Any]]:
+        """Return a compact list of input-capable devices for debugging selection."""
+        out = []
+        try:
+            for idx, dev in enumerate(sd.query_devices()):
+                if int(dev.get("max_input_channels", 0)) > 0:
+                    out.append(
+                        {
+                            "index": idx,
+                            "name": dev.get("name"),
+                            "hostapi": dev.get("hostapi"),
+                            "default_samplerate": dev.get("default_samplerate"),
+                            "max_input_channels": dev.get("max_input_channels"),
+                        }
+                    )
+        except Exception as e:
+            self.log("warning", f"Device query failed: {e}")
+        return out
 
-# Global KWD instance
+
+# -----------------------------
+# Global Instance
+# -----------------------------
 kwd_service = KWDService()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     await kwd_service.startup()
     yield
-    # Shutdown
     await kwd_service.shutdown()
 
 
+# -----------------------------
 # FastAPI app
+# -----------------------------
 app = FastAPI(
     title="KWD Service",
     description="Wake Word Detection using openWakeWord",
-    version="1.0",
-    lifespan=lifespan
+    version="1.2",
+    lifespan=lifespan,
 )
 
 
 @app.post("/on-system-ready")
 async def on_system_ready():
-    """Called by loader after all services are ready"""
-    if kwd_service.state not in [KWDState.READY, KWDState.SLEEP]:
-        raise HTTPException(status_code=400, detail=f"Service not ready, state: {kwd_service.state}")
-    
-    kwd_service.log("info", "System ready signal received", "system_ready")
-    
-    # Play greeting and activate in background
+    """Called by loader after all services are READY."""
+    if kwd_service.state not in (KWDState.READY, KWDState.SLEEP):
+        raise HTTPException(status_code=400, detail=f"Service not ready (state={kwd_service.state})")
+    kwd_service.log("info", "System ready received", "system_ready")
     threading.Thread(target=kwd_service.play_greeting_and_activate, daemon=True).start()
-    
-    return {"status": "ok", "message": "Greeting and activation initiated"}
-
+    return {"status": "ok", "message": "Greeting + activation started"}
 
 @app.post("/start")
-async def start_detection(request: StartRequest = StartRequest()):
-    """Start or re-arm wake word detection"""
+async def start_detection(_req: StartRequest = StartRequest()):
+    """Arm or re-arm detection."""
     if kwd_service.state == KWDState.INIT:
         raise HTTPException(status_code=400, detail="Service not initialized")
-    
     if kwd_service.start_detection():
-        kwd_service.log("info", "Detection re-armed", "rearmed")
+        kwd_service.log("info", "Detection armed", "rearmed")
         return {"status": "ok", "state": kwd_service.state}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to start detection")
-
+    raise HTTPException(status_code=500, detail="Failed to start detection")
 
 @app.post("/stop")
-async def stop_detection_endpoint(request: StopRequest = StopRequest()):
-    """Stop wake word detection"""
+async def stop_detection_endpoint(req: StopRequest = StopRequest()):
+    """Stop detection (sleep)."""
     kwd_service.stop_detection()
-    reason = request.reason or "manual stop"
-    kwd_service.log("info", f"Detection stopped: {reason}", "kwd_stopped")
+    kwd_service.log("info", f"Detection stopped: {req.reason or 'manual'}", "kwd_stopped")
     return {"status": "ok", "state": kwd_service.state}
-
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health: ok when not INIT."""
     status = "ok" if kwd_service.state != KWDState.INIT else "error"
     return HealthResponse(status=status, state=kwd_service.state)
 
-
 @app.get("/state")
 async def get_state():
-    """Get current service state"""
     return StateResponse(state=kwd_service.state)
+
+@app.get("/devices")
+async def list_devices():
+    """List input-capable devices to help select the correct mic."""
+    return {"devices": kwd_service.list_input_devices()}
 
 
 def main():
-    """Entry point when run as module"""
     uvicorn.run(
         app,
         host="127.0.0.1",
         port=kwd_service.port,
-        log_level="error",  # Suppress uvicorn logs to keep console clean
-        access_log=False
+        log_level="error",
+        access_log=False,
     )
 
 

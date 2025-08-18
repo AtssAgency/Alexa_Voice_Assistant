@@ -20,6 +20,7 @@ dependencies = [
     "sounddevice==0.5.2",
     "soundfile==0.13.1",
     "torch>=2.8.0",
+    "torchaudio>=2.8.0",
     "uvicorn==0.34.0",
     "websockets==15.0.1",
 ]
