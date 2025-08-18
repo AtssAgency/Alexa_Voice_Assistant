@@ -96,3 +96,6 @@ async def safe_get(url: str, timeout: float = 2.0) -> Optional[dict]:
         return None
     except Exception:
         return None
+
+# Alias for backwards compatibility
+lifespan_clients = lifespan_with_httpx

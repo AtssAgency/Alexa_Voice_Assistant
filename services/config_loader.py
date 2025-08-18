@@ -37,20 +37,36 @@ class KWDAdaptive(BaseModel):
 
 class KWDeps(BaseModel):
     logger_url: str
+    logger_route: str = "/log"
     tts_url: str
-    stt_url: str
+    tts_route: str = "/speak"
+    stt_url: str  
+    stt_route: str = "/start"
     rms_url: str
+    rms_route: str = "/current-rms"
+
+class AudioConfig(BaseModel):
+    device_index: int = -1
+    sample_rate: int = 16000
+    frame_ms: int = 32
+    dtype: str = "int16"
+    dc_block: bool = True
+    min_frame_rms: float = 0.003
 
 class KWDConfig(BaseModel):
     bind_host: str = "127.0.0.1"
     port: int = 5002
     model_path: str
-    base_rms_threshold: float
-    cooldown_ms: int
-    yes_phrases: str
-    greeting_text: str
-    adaptive: KWDAdaptive
-    deps: KWDeps
+    base_threshold: float = 0.050
+    base_rms_threshold: float = 0.050
+    cooldown_ms: int = 1000
+    debounce_after_tts_ms: int = 2000
+    silence_required_ms: int = 1000
+    rearm_timeout_ms: int = 3000
+    fire_cons_frames: int = 2
+    frame_ms: int = 80
+    yes_phrases: str = "Yes?,Yes Master?,What's up?,I'm listening,Yo,Here!"
+    greeting_text: str = "Hi Master. Ready to serve."
 
 class STTAudio(BaseModel):
     device_index: int = -1
@@ -157,6 +173,9 @@ class AppConfig(BaseModel):
     logger: LoggerConfig
     rms: RMSConfig
     kwd: KWDConfig
+    kwd_adaptive: KWDAdaptive
+    kwd_deps: KWDeps
+    audio: AudioConfig
     stt: STTConfig
     llm: LLMConfig
     tts: TTSConfig
@@ -186,11 +205,10 @@ def load_app_config() -> AppConfig:
             **section_to_dict("rms"),
             "deps": section_to_dict("rms.deps")
         },
-        "kwd": {
-            **section_to_dict("kwd"),
-            "adaptive": section_to_dict("kwd.adaptive"),
-            "deps": section_to_dict("kwd.deps")
-        },
+        "kwd": section_to_dict("kwd"),
+        "kwd_adaptive": section_to_dict("kwd.adaptive"),
+        "kwd_deps": section_to_dict("kwd.deps"),
+        "audio": section_to_dict("stt.audio"),  # Use stt.audio for the audio config
         "stt": {
             **section_to_dict("stt"),
             "audio": section_to_dict("stt.audio"),

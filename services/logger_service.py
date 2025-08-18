@@ -27,6 +27,7 @@ from pydantic import BaseModel
 import uvicorn
 from .config_loader import app_config
 from .shared import lifespan_with_httpx
+from .utils import create_service_app, get_timestamp, format_console_message
 
 
 # Request/Response Models
@@ -135,11 +136,11 @@ class LoggerService:
     
     def get_timestamp(self) -> str:
         """Get timestamp in dd-mm-yy hh:mm:ss format"""
-        return datetime.now().strftime("%d-%m-%y %H:%M:%S")
+        return get_timestamp()
     
     def format_console_message(self, svc: str, level: str, message: str) -> str:
         """Format message for console output using the specified template"""
-        return f"{svc:<10}{level.upper():<6}= {message}"
+        return format_console_message(svc, level, message)
     
     def should_echo_to_console(self, level: str, event: Optional[str]) -> bool:
         """Determine if message should be echoed to console based on log level and echo policy"""
@@ -265,8 +266,8 @@ async def service_lifespan():
     logger_service.cleanup()
 
 
-# FastAPI app
-app = FastAPI(
+# FastAPI app  
+app = create_service_app(
     title="Logger Service",
     description="Central logging, metrics aggregation, and dialog transcripts",
     version="1.0",
@@ -436,7 +437,7 @@ def main():
     uvicorn.run(
         app,
         host="127.0.0.1",
-        port=logger_service.port,
+        port=app_config.logger.port,  # Get port from config
         log_level="error",  # Suppress uvicorn logs to keep console clean
         access_log=False
     )

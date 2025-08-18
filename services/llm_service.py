@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from .config_loader import app_config
 from .shared import lifespan_with_httpx, safe_post, safe_get
+from .utils import post_log, create_service_app
 
 
 class LLMState:
@@ -153,18 +154,16 @@ class LLMService:
     
     async def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
-        payload = {
-            "svc": "LLM",
-            "level": level,
-            "message": message,
-        }
-        if event:
-            payload["event"] = event
-        if extra:
-            payload["extra"] = extra
-            
-        fallback_msg = f"LLM       {level.upper():<6}= {message}"
-        await safe_post(f"{self.logger_url}/log", json=payload, timeout=2.0, fallback_msg=fallback_msg)
+        # Delegate logging to the shared utility
+        await post_log(
+            service="LLM",
+            level=level,
+            message=message,
+            logger_url=self.logger_url,
+            event=event,
+            extra=extra,
+            timeout=2.0
+        )
     
     async def send_metric(self, metric: str, value: float, dialog_id: str = None):
         """Send metric to Logger service"""
@@ -482,7 +481,7 @@ async def service_lifespan():
 
 
 # FastAPI app
-app = FastAPI(
+app = create_service_app(
     title="LLM Service",
     description="Streaming Language Model Completions via Ollama",
     version="1.0",
@@ -564,7 +563,7 @@ def main():
     uvicorn.run(
         app,
         host="127.0.0.1",
-        port=llm_service.port,
+        port=app_config.llm.port,  # Get port from config
         log_level="error",  # Suppress uvicorn logs to keep console clean
         access_log=False
     )

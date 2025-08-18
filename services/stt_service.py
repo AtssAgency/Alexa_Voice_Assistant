@@ -28,6 +28,7 @@ from pydantic import BaseModel
 import uvicorn
 from .config_loader import app_config
 from .shared import lifespan_with_httpx, safe_post, safe_get
+from .utils import post_log, create_service_app
 
 # ============
 # Runtime env (stability for CTranslate2 / faster-whisper)
@@ -200,14 +201,16 @@ class STTService:
     # Logging
     # ---------------
     async def log(self, level: str, message: str, event: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
-        payload = {"svc": "STT", "level": level, "message": message}
-        if event:
-            payload["event"] = event
-        if extra:
-            payload["extra"] = extra
-        
-        fallback_msg = f"STT       {level.upper():<6}= {message}"
-        await safe_post(f"{self.logger_url}/log", json=payload, timeout=1.5, fallback_msg=fallback_msg)
+        # Delegate logging to the shared utility
+        await post_log(
+            service="STT",
+            level=level,
+            message=message,
+            logger_url=self.logger_url,
+            event=event,
+            extra=extra,
+            timeout=1.5
+        )
 
     async def log_dialog(self, dialog_id: str, role: str, text: str):
         await safe_post(
@@ -779,7 +782,7 @@ async def service_lifespan():
     yield
     await stt_service.shutdown()
 
-app = FastAPI(
+app = create_service_app(
     title="STT Service",
     description="Silero VAD + faster-whisper dialog manager",
     version="1.3",
@@ -857,8 +860,8 @@ async def get_chosen_device():
 def main():
     uvicorn.run(
         app,
-        host=stt_service.bind_host,
-        port=stt_service.port,
+        host="127.0.0.1",
+        port=app_config.stt.port,  # Get port from config
         log_level="error",
         access_log=False
     )

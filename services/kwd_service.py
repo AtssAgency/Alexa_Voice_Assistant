@@ -38,6 +38,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from .config_loader import app_config
 from .shared import lifespan_with_httpx, safe_post, safe_get
+from .utils import post_log, create_service_app, compose_url
 
 # --- Third-party wake word model ---
 try:
@@ -176,44 +177,17 @@ class KWDService:
     # -----------------------------
     # URL helpers
     # -----------------------------
-    @staticmethod
-    def _compose_url(base: str, route: str) -> str:
-        """
-        Backward-compatible URL joiner:
-        - If route is absolute (starts with http), return route.
-        - If base already ends with the same route, return base.
-        - If base already includes a path (e.g., .../speak) and route == '/speak', don't duplicate.
-        - Else join cleanly.
-        """
-        if not base:
-            return route or ""
-        if route and route.startswith("http"):
-            return route
-
-        base_clean = base.rstrip("/")
-        route_clean = (route or "").lstrip("/")
-
-        # If base already contains a path and ends with route, don't append
-        if route_clean and base_clean.split("://")[-1].rstrip("/").endswith(route_clean):
-            return base_clean
-
-        # If route empty, use base as-is
-        if not route_clean:
-            return base_clean
-
-        return f"{base_clean}/{route_clean}"
-
     def _url_logger(self) -> str:
-        return self._compose_url(self.logger_base, self.logger_route)
+        return compose_url(self.logger_base, self.logger_route)
 
     def _url_rms(self) -> str:
-        return self._compose_url(self.rms_base, self.rms_route)
+        return compose_url(self.rms_base, self.rms_route)
 
     def _url_tts(self) -> str:
-        return self._compose_url(self.tts_base, self.tts_route)
+        return compose_url(self.tts_base, self.tts_route)
 
     def _url_stt(self) -> str:
-        return self._compose_url(self.stt_base, self.stt_route)
+        return compose_url(self.stt_base, self.stt_route)
 
     # -----------------------------
     # Logging
@@ -221,14 +195,16 @@ class KWDService:
 
     async def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send structured log to Logger or fallback to stdout."""
-        payload = {"svc": "KWD", "level": level, "message": message}
-        if event:
-            payload["event"] = event
-        if extra:
-            payload["extra"] = extra
-        
-        fallback_msg = f"KWD       {level.upper():<6}= {message}"
-        await safe_post(self._url_logger(), json=payload, timeout=1.5, fallback_msg=fallback_msg)
+        # Delegate logging to the shared utility
+        await post_log(
+            service="KWD",
+            level=level,
+            message=message,
+            logger_url=self.logger_base,
+            event=event,
+            extra=extra,
+            timeout=1.5
+        )
 
     # -----------------------------
     # RMS → Adaptive threshold
@@ -688,11 +664,12 @@ async def service_lifespan():
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(
+# Create the app using the factory
+app = create_service_app(
     title="KWD Service",
     description="Wake Word Detection using openWakeWord",
     version="1.3",
-    lifespan=lambda app: lifespan_with_httpx(service_lifespan),
+    lifespan=lambda app: lifespan_with_httpx(service_lifespan)
 )
 
 
@@ -742,7 +719,7 @@ def main():
     uvicorn.run(
         app,
         host="127.0.0.1",
-        port=kwd_service.port,
+        port=app_config.kwd.port,  # Get port from config
         log_level="error",
         access_log=False,
     )
