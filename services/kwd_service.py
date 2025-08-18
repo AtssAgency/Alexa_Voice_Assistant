@@ -574,33 +574,24 @@ class KWDService:
         self.in_progress = False
         await self.log("info", "Wake word detection stopped", "kwd_stopped")
 
-    def play_greeting_and_activate(self):
-        """Say greeting, then arm detection (even if TTS fails)."""
+    async def play_greeting_and_activate(self):
+        """Say greeting, then arm detection (asynchronous)."""
         url = self._url_tts()
         try:
             payload = TTSSpeakRequest(text=self.greeting_text).dict()
-            # Use asyncio bridge for HTTP call from thread
-            try:
-                loop = asyncio.get_event_loop()
-                asyncio.run_coroutine_threadsafe(
-                    safe_post(url, json=payload, timeout=8.0,
-                             fallback_msg=f"KWD       INFO  = Greeting played: '{self.greeting_text}'"),
-                    loop
-                )
-                time.sleep(0.5)
-            except:
-                print(f"KWD       INFO  = Greeting played: '{self.greeting_text}'")
+            await safe_post(
+                url,
+                json=payload,
+                timeout=8.0,
+                fallback_msg=f"KWD       INFO  = Greeting played: '{self.greeting_text}'"
+            )
+            await asyncio.sleep(0.5)
         except Exception as e:
-            print(f"KWD       WARNING= Greeting error: {e}")
+            # Use await here since log is async
+            await self.log("warning", f"Greeting error: {e}")
         finally:
-            # Start detection using asyncio bridge
-            try:
-                loop = asyncio.get_event_loop()
-                asyncio.run_coroutine_threadsafe(
-                    self.start_detection(), loop
-                )
-            except:
-                pass  # Skip if no event loop available
+            # Directly await the async method
+            await self.start_detection()
 
     # -----------------------------
     # Lifecycle
@@ -679,7 +670,8 @@ async def on_system_ready():
     if kwd_service.state not in (KWDState.READY, KWDState.SLEEP):
         raise HTTPException(status_code=400, detail=f"Service not ready (state={kwd_service.state})")
     await kwd_service.log("info", "System ready received", "system_ready")
-    threading.Thread(target=kwd_service.play_greeting_and_activate, daemon=True).start()
+    # Use asyncio.create_task to run as a background task on the correct event loop
+    asyncio.create_task(kwd_service.play_greeting_and_activate())
     return {"status": "ok", "message": "Greeting + activation started"}
 
 @app.post("/start")

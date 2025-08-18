@@ -76,16 +76,19 @@ class LoaderService:
         
         # Try to use config_loader if available, otherwise use defaults
         if HAVE_CONFIG_LOADER and app_config:
+            # --- CORRECTED ACCESS ---
+            # Access nested models correctly via app_config.loader
             loader_config = app_config.loader
-            paths_config = app_config.paths
-            deps_config = app_config.deps
+            paths_config = app_config.loader.paths
+            
+            # Construct logger_url from the logger's own config
+            self.logger_url = f"http://127.0.0.1:{app_config.logger.port}"
             
             # Configuration from config_loader
-            self.logger_url = deps_config.logger_url
-            self.startup_order = loader_config.startup_order
+            self.startup_order = [s.strip() for s in loader_config.startup_order.split(',')]
             self.health_timeout_s = loader_config.health_timeout_s
             self.health_interval_ms = loader_config.health_interval_ms
-            self.restart_backoff_ms = loader_config.restart_backoff_ms
+            self.restart_backoff_ms = [int(x.strip()) for x in loader_config.restart_backoff_ms.split(',')]
             self.crash_loop_threshold = loader_config.crash_loop_threshold
             self.port_hygiene = loader_config.port_hygiene
             self.vram_probe_cmd = loader_config.vram_probe_cmd
@@ -133,31 +136,31 @@ class LoaderService:
             self.config = configparser.ConfigParser()
             self.config.read(config_path)
             
-            # Load loader section
-            if 'loader' in self.config:
-                loader_section = self.config['loader']
-                self.startup_order = [s.strip() for s in loader_section.get('startup_order', 'logger,rms,kwd,stt,llm,tts').split(',')]
-                self.health_timeout_s = loader_section.getint('health_timeout_s', 30)
-                self.health_interval_ms = loader_section.getint('health_interval_ms', 200)
+            # Load loader section if not already loaded by Pydantic
+            if not HAVE_CONFIG_LOADER:
+                if 'loader' in self.config:
+                    loader_section = self.config['loader']
+                    self.startup_order = [s.strip() for s in loader_section.get('startup_order', 'logger,rms,kwd,stt,llm,tts').split(',')]
+                    self.health_timeout_s = loader_section.getint('health_timeout_s', 30)
+                    self.health_interval_ms = loader_section.getint('health_interval_ms', 200)
+                    
+                    backoff_str = loader_section.get('restart_backoff_ms', '250,500,1000,2000')
+                    self.restart_backoff_ms = [int(x.strip()) for x in backoff_str.split(',')]
+                    
+                    self.crash_loop_threshold = loader_section.getint('crash_loop_threshold', 3)
+                    self.port_hygiene = loader_section.getboolean('port_hygiene', True)
+                    self.vram_probe_cmd = loader_section.get('vram_probe_cmd', self.vram_probe_cmd)
+                    self.warmup_llm = loader_section.getboolean('warmup_llm', True)
+                    self.greeting_on_ready = loader_section.getboolean('greeting_on_ready', True)
                 
-                backoff_str = loader_section.get('restart_backoff_ms', '250,500,1000,2000')
-                self.restart_backoff_ms = [int(x.strip()) for x in backoff_str.split(',')]
-                
-                self.crash_loop_threshold = loader_section.getint('crash_loop_threshold', 3)
-                self.port_hygiene = loader_section.getboolean('port_hygiene', True)
-                self.vram_probe_cmd = loader_section.get('vram_probe_cmd', self.vram_probe_cmd)
-                self.warmup_llm = loader_section.getboolean('warmup_llm', True)
-                self.greeting_on_ready = loader_section.getboolean('greeting_on_ready', True)
+                # Load paths section
+                if 'paths' in self.config:
+                    paths_section = self.config['paths']
+                    python_override = paths_section.get('python', None)
+                    if python_override:
+                        self.python = python_override
             
-            # Load paths section
-            if 'paths' in self.config:
-                paths_section = self.config['paths']
-                python_override = paths_section.get('python', None)
-                if python_override:
-                    self.python = python_override
-                # workdir removed - services run from current directory
-            
-            # Load service configurations
+            # Load service configurations (always needed)
             for section_name in self.config.sections():
                 if section_name.startswith('svc.'):
                     service_name = section_name[4:]  # Remove 'svc.' prefix
@@ -413,8 +416,6 @@ class LoaderService:
             self.log_to_logger("error", f"Failed to spawn {service_name}: {e}", "service_error")
             return False
     
-    # services/loader_service.py
-
     def health_check_service(self, service_name: str) -> bool:
         """Check if service is healthy via /health endpoint."""
         if service_name not in self.services:
