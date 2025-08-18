@@ -154,8 +154,8 @@ class LoggerService:
             return False
     
     def get_timestamp(self) -> str:
-        """Get ISO timestamp"""
-        return datetime.utcnow().isoformat() + 'Z'
+        """Get timestamp in dd-mm-yy hh:mm:ss format"""
+        return datetime.now().strftime("%d-%m-%y %H:%M:%S")
     
     def format_console_message(self, svc: str, level: str, message: str) -> str:
         """Format message for console output using the specified template"""
@@ -305,7 +305,7 @@ async def log_event(request: LogRequest):
         # Use current timestamp if not provided
         timestamp = logger_service.get_timestamp()
         if request.ts_ms:
-            timestamp = datetime.fromtimestamp(request.ts_ms / 1000).isoformat() + 'Z'
+            timestamp = datetime.fromtimestamp(request.ts_ms / 1000).strftime("%d-%m-%y %H:%M:%S")
         
         # Build log entry
         log_data = {

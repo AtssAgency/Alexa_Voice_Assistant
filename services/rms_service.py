@@ -20,7 +20,6 @@ import math
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
-import configparser
 from collections import deque
 
 import requests
@@ -30,6 +29,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
+from .config_loader import app_config
 
 
 class RMSState:
@@ -57,21 +57,24 @@ class StateResponse(BaseModel):
 class RMSService:
     def __init__(self):
         self.state = RMSState.INIT
-        self.config: Optional[configparser.ConfigParser] = None
         
-        # Service URLs
-        self.logger_url = "http://127.0.0.1:5000"
+        # --- Config is now clean and type-safe ---
+        self.cfg = app_config.rms
         
-        # Configuration
-        self.port = 5006
-        self.sample_rate = 16000
-        self.frame_ms = 50
-        self.window_sec = 30
-        self.ema_alpha = 0.2
-        self.noise_floor_mode = "p05"  # "min", "p05", "p10"
-        self.device = "default"
-        self.shared_mode = True
-        self.stats_interval_sec = 5
+        # Service configuration
+        self.bind_host = self.cfg.bind_host
+        self.port = self.cfg.port
+        self.sample_rate = self.cfg.sample_rate
+        self.frame_ms = self.cfg.frame_ms
+        self.window_sec = self.cfg.window_sec
+        self.ema_alpha = self.cfg.ema_alpha
+        self.noise_floor_mode = self.cfg.noise_floor_mode
+        self.device = self.cfg.device
+        self.shared_mode = self.cfg.shared_mode
+        self.stats_interval_sec = self.cfg.stats_interval_sec
+        
+        # Dependencies
+        self.logger_url = self.cfg.deps.logger_url
         
         # Audio sampling
         self.audio_stream = None
@@ -95,44 +98,11 @@ class RMSService:
         self.retry_count = 0
         self.max_retries = 5
         self.retry_backoff_base = 1.0
-    
-    def load_config(self) -> bool:
-        """Load configuration from config files"""
-        try:
-            config_path = Path("config/config.ini")
-            if config_path.exists():
-                self.config = configparser.ConfigParser()
-                self.config.read(config_path)
-                
-                # Load RMS section
-                if 'rms' in self.config:
-                    rms_section = self.config['rms']
-                    self.port = rms_section.getint('port', self.port)
-                    self.sample_rate = rms_section.getint('sample_rate', self.sample_rate)
-                    self.frame_ms = rms_section.getint('frame_ms', self.frame_ms)
-                    self.window_sec = rms_section.getint('window_sec', self.window_sec)
-                    self.ema_alpha = rms_section.getfloat('ema_alpha', self.ema_alpha)
-                    self.noise_floor_mode = rms_section.get('noise_floor_mode', self.noise_floor_mode)
-                    self.device = rms_section.get('device', self.device)
-                    self.shared_mode = rms_section.getboolean('shared_mode', self.shared_mode)
-                    self.stats_interval_sec = rms_section.getint('stats_interval_sec', self.stats_interval_sec)
-                
-                # Load dependencies section
-                if 'deps' in self.config:
-                    deps_section = self.config['deps']
-                    self.logger_url = deps_section.get('logger_url', self.logger_url)
-            
-            # Calculate derived values
-            self.frame_samples = int(self.sample_rate * self.frame_ms / 1000)
-            frames_per_window = int(self.window_sec * 1000 / self.frame_ms)
-            self.ring_buffer_max_size = frames_per_window
-            
-            self.log("info", "Configuration loaded successfully", "config_loaded")
-            return True
-            
-        except Exception as e:
-            self.log("error", f"Failed to load config: {e}")
-            return False
+        
+        # Calculate derived values from configuration
+        self.frame_samples = int(self.sample_rate * self.frame_ms / 1000)
+        frames_per_window = int(self.window_sec * 1000 / self.frame_ms)
+        self.ring_buffer_max_size = frames_per_window
     
     def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send log message to Logger service"""
@@ -409,11 +379,6 @@ class RMSService:
         try:
             self.log("info", "RMS service starting", "service_start")
             
-            # Load configuration
-            if not self.load_config():
-                self.state = RMSState.ERROR
-                return False
-            
             # Initialize audio device
             if not self.initialize_audio_device():
                 self.state = RMSState.ERROR
@@ -470,19 +435,16 @@ async def get_current_rms():
 
 @app.post("/reload")
 async def reload_config():
-    """Reload configuration from files"""
-    if rms_service.load_config():
-        return {
-            "status": "ok",
-            "config": {
-                "sample_rate": rms_service.sample_rate,
-                "window_sec": rms_service.window_sec,
-                "noise_floor_mode": rms_service.noise_floor_mode,
-                "device": rms_service.device
-            }
+    """Get current configuration (reload not needed with config_loader)"""
+    return {
+        "status": "ok",
+        "config": {
+            "sample_rate": rms_service.sample_rate,
+            "window_sec": rms_service.window_sec,
+            "noise_floor_mode": rms_service.noise_floor_mode,
+            "device": rms_service.device
         }
-    else:
-        raise HTTPException(status_code=500, detail="Failed to reload configuration")
+    }
 
 
 @app.get("/health", response_model=HealthResponse)

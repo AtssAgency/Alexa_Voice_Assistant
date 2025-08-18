@@ -22,7 +22,6 @@ import queue
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, AsyncGenerator
-import configparser
 import re
 
 import requests
@@ -34,6 +33,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
+from .config_loader import app_config
 
 # Import Kokoro TTS components
 try:
@@ -94,27 +94,30 @@ class PlaybackEvent(BaseModel):
 class TTSService:
     def __init__(self):
         self.state = TTSState.INIT
-        self.config: Optional[configparser.ConfigParser] = None
+        
+        # Load configuration from config_loader
+        tts_config = app_config.tts
+        deps_config = app_config.deps
         
         # Service URLs
-        self.logger_url = "http://127.0.0.1:5000"
+        self.logger_url = deps_config.logger_url
         
         # Configuration
-        self.port = 5005
-        self.voice = "af_heart"
-        self.sample_rate = 24000
-        self.device = "cuda"
-        self.dtype = "float16"
-        self.max_queue_text = 64
-        self.max_queue_audio = 8
-        self.chunk_chars = 120
-        self.silence_pad_ms = 60
-        self.allow_llm_pull = False
+        self.port = tts_config.port
+        self.voice = tts_config.voice
+        self.sample_rate = tts_config.sample_rate
+        self.device = tts_config.device
+        self.dtype = tts_config.dtype
+        self.max_queue_text = tts_config.max_queue_text
+        self.max_queue_audio = tts_config.max_queue_audio
+        self.chunk_chars = tts_config.chunk_chars
+        self.silence_pad_ms = tts_config.silence_pad_ms
+        self.allow_llm_pull = tts_config.allow_llm_pull
         
         # ONNX assets
-        self.model_path = "models/kokoro_onnx/kokoro-v1.0.fp16.onnx"
-        self.voices_path = "models/kokoro_onnx/voices-v1.0.bin"
-        self.quant_preference = "fp16"
+        self.model_path = tts_config.model_path
+        self.voices_path = tts_config.voices_path
+        self.quant_preference = tts_config.quant_preference
         
         # Kokoro TTS engine
         self.tts_engine: Optional[Kokoro] = None

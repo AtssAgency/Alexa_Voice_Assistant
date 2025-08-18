@@ -1,58 +1,66 @@
 #!/usr/bin/env python3
 """
-STT Service - Speech-to-Text with Dialog Session Management
+STT Service - Speech-to-Text with Silero VAD & Dialog Session Management
 
-FastAPI service on port 5003 that:
-- Owns and executes the STT-led dialog loop
-- Captures user speech and transcribes with faster-whisper (small.en)
-- Streams LLM responses and forwards to TTS via WebSocket
-- Manages follow-up timing and re-arms KWD after dialog completion
-- Adapts VAD thresholds based on RMS ambient noise readings
+FastAPI service on port [stt.port] that:
+- Waits for wake word (KWD), then captures speech with Silero VAD start/stop gating
+- Transcribes via faster-whisper (configurable), streams LLM response to TTS
+- Re-arms KWD after dialog, exposes /devices, robust /health, graceful shutdown
 
-State: INIT → READY → ACTIVE (dialog loop) → READY
+State: INIT → READY → ACTIVE → READY
 """
 
 import os
-import sys
 import time
+import json
 import asyncio
 import threading
-import queue
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
-import configparser
-import json
+from typing import Optional, Dict, Any, List, Deque
+from collections import deque
+from contextlib import asynccontextmanager
 
 import numpy as np
 import sounddevice as sd
 import requests
 import websockets
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from contextlib import asynccontextmanager
 import uvicorn
+from .config_loader import app_config
+
+# ============
+# Runtime env (stability for CTranslate2 / faster-whisper)
+# ============
+os.environ.setdefault("CT2_USE_MKL", "0")
+os.environ.setdefault("CT2_FORCE_CPU_ISA", "AVX2")  # use "DEFAULT" if AVX2 missing
+
+# =========================
+# Dependencies (runtime)
+# =========================
+try:
+    import torch
+except Exception:
+    print("ERROR: PyTorch is required for Silero VAD. Install it in your venv.")
+    raise
 
 try:
+    # faster-whisper for transcription (keeps VRAM low per config)
     from faster_whisper import WhisperModel
-except ImportError:
-    print("ERROR: faster-whisper not installed. Run: pip install faster-whisper")
-    sys.exit(1)
-
-try:
-    import webrtcvad
-except ImportError:
-    print("WARNING: webrtcvad not installed. VAD will use basic energy detection")
-    webrtcvad = None
+except Exception:
+    print("ERROR: faster-whisper is required. Install it in your venv.")
+    raise
 
 
+# -------------------------
+# Models / DTOs
+# -------------------------
 class STTState:
     INIT = "INIT"
-    READY = "READY"  
+    READY = "READY"
     ACTIVE = "ACTIVE"
 
 
-# Request/Response Models
 class StartRequest(BaseModel):
     dialog_id: str
 
@@ -71,696 +79,779 @@ class StateResponse(BaseModel):
     state: str
 
 
-class LLMCompleteRequest(BaseModel):
-    text: str
-    dialog_id: str
-    history: Optional[List[Dict[str, str]]] = None
+# =========================
+# Silero VAD wrapper
+# =========================
+class SileroVAD:
+    """
+    Minimal Silero VAD wrapper.
+    - Accepts int16 mono @ 16kHz frames.
+    - Returns speech probability per frame (0..1).
+    """
+    def __init__(self, sample_rate: int = 16000, device: str = "cpu"):
+        self.sample_rate = sample_rate
+        self.device = device if torch.cuda.is_available() and device == "cuda" else "cpu"
+        # Load Silero from torch.hub (snakers4)
+        self.model, self.utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            onnx=False,
+            verbose=False
+        )
+        (self.get_speech_timestamps,
+         self.save_audio,
+         self.read_audio,
+         self.VADIterator,
+         self.collect_chunks) = self.utils
+        self.model.to(self.device)
+        self.model.eval()
+        self._dtype = torch.float32
+
+    @torch.no_grad()
+    def prob(self, audio_int16: np.ndarray) -> float:
+        """
+        Returns model speech prob for a single frame buffer (int16).
+        Internally converts to float32 [-1,1] torch tensor.
+        """
+        if audio_int16.ndim != 1:
+            audio_int16 = audio_int16.reshape(-1)
+        a = torch.tensor(audio_int16.astype(np.float32) / 32768.0, dtype=self._dtype, device=self.device)
+        logits = self.model(a, self.sample_rate).squeeze(0)
+        if logits.numel() == 0:
+            return 0.0
+        p = torch.sigmoid(logits).mean().item()
+        return float(p)
 
 
+# =========================
+# STT Service
+# =========================
 class STTService:
     def __init__(self):
         self.state = STTState.INIT
-        self.config: Optional[configparser.ConfigParser] = None
         
-        # Service URLs
-        self.logger_url = "http://127.0.0.1:5000"
-        self.rms_url = "http://127.0.0.1:5006"
-        self.kwd_url = "http://127.0.0.1:5002"
-        self.llm_url = "http://127.0.0.1:5004"
-        self.tts_ws_speak = "ws://127.0.0.1:5005/speak-stream"
-        self.tts_ws_events = "ws://127.0.0.1:5005/playback-events"
+        # --- Config is now clean and type-safe ---
+        self.cfg = app_config.stt
         
-        # Configuration
-        self.port = 5003
-        self.model_size = "small.en"
-        self.device = "cuda"
-        self.compute_type = "int8_float16"
-        self.beam_size = 1
-        self.vad_finalize_sec = 2.0
-        self.chunk_length_s = 15.0
-        self.follow_up_timer_sec = 4.0
-        self.word_timestamps = False
-        
-        # Adaptive VAD
-        self.quiet_dbfs = -60
-        self.noisy_dbfs = -35
-        self.silence_margin_db = 8.0
-        self.energy_delta_db = 6.0
-        
-        # Audio settings
-        self.sample_rate = 16000
-        self.chunk_size = 1024  # 64ms at 16kHz
-        
-        # Whisper model
+        # Main service settings
+        self.bind_host = self.cfg.bind_host
+        self.port = self.cfg.port
+
+        # Whisper
+        self.model_size = self.cfg.model_size
+        self.whisper_device = self.cfg.device
+        self.compute_type = self.cfg.compute_type
+        self.beam_size = self.cfg.beam_size
+        self.word_timestamps = self.cfg.word_timestamps
+        self.chunk_length_s = self.cfg.chunk_length_s
+
+        # Follow-up
+        self.follow_up_timer_sec = self.cfg.follow_up_timer_sec
+
+        # Audio configuration
+        self.audio_device_index = self.cfg.audio.device_index
+        self.audio_device_name = ""  # preferred device by name (exact/substring)
+        self.sample_rate = self.cfg.audio.sample_rate
+        self.frame_ms = self.cfg.audio.frame_ms
+        self.frame_samples = int(self.sample_rate * self.frame_ms / 1000)
+        self.dtype = self.cfg.audio.dtype
+        self.dc_block = self.cfg.audio.dc_block
+        self.min_frame_rms = self.cfg.audio.min_frame_rms
+
+        # VAD / gating (Silero)
+        self.vad_start_threshold = self.cfg.vad.start_threshold
+        self.vad_end_threshold = self.cfg.vad.end_threshold
+        self.vad_min_start_frames = self.cfg.vad.min_start_frames
+        self.vad_max_silence_ms = self.cfg.vad.max_silence_ms
+        self.vad_pre_roll_ms = self.cfg.vad.pre_roll_ms
+        self.vad_speech_pad_ms = self.cfg.vad.speech_pad_ms
+
+        # Adaptive (from RMS)
+        self.quiet_dbfs = self.cfg.adaptive.quiet_dbfs
+        self.noisy_dbfs = self.cfg.adaptive.noisy_dbfs
+
+        # Dependencies
+        self.logger_url = self.cfg.deps.logger_url
+        self.llm_complete_url = self.cfg.deps.llm_url
+        self.tts_ws_speak = self.cfg.deps.tts_ws_speak
+        self.tts_ws_events = self.cfg.deps.tts_ws_events
+        self.kwd_start_url = self.cfg.deps.kwd_url
+        self.kwd_state_url = self.cfg.deps.kwd_url + "/state"  # Construct state URL
+        self.rms_current_url = self.cfg.deps.rms_url
+
+        # Runtime holders
         self.model: Optional[WhisperModel] = None
-        
-        # Dialog session state
+        self.vad: Optional[SileroVAD] = None
+
         self.active_dialog_id: Optional[str] = None
-        self.dialog_thread: Optional[threading.Thread] = None
         self.stop_flag = threading.Event()
-        
-        # Audio capture
+        self.dialog_thread: Optional[threading.Thread] = None
+
         self.audio_stream: Optional[sd.InputStream] = None
-        self.audio_buffer = []
-        self.buffer_lock = threading.Lock()
-        
-        # VAD
-        self.vad = None
-        if webrtcvad:
-            self.vad = webrtcvad.Vad(2)  # Aggressiveness level 2
-        
-        # WebSocket connections
+        self._raw_queue: Deque[np.ndarray] = deque(maxlen=2048)  # store int16 frames
+        self._dc_prev = 0.0  # for DC-block filter
+
+        # WS
         self.tts_speak_ws: Optional[websockets.WebSocketClientProtocol] = None
         self.tts_events_ws: Optional[websockets.WebSocketClientProtocol] = None
-    
-    def load_config(self) -> bool:
-        """Load configuration from config/config.ini"""
+
+    # ---------------
+    # Logging
+    # ---------------
+    def log(self, level: str, message: str, event: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
         try:
-            config_path = Path("config/config.ini")
-            if not config_path.exists():
-                self.log("warning", "config/config.ini not found, using defaults")
-                return True
-                
-            self.config = configparser.ConfigParser()
-            self.config.read(config_path)
-            
-            # Load STT section
-            if 'stt' in self.config:
-                stt_section = self.config['stt']
-                self.port = stt_section.getint('port', self.port)
-                self.model_size = stt_section.get('model_size', self.model_size)
-                self.device = stt_section.get('device', self.device)
-                self.compute_type = stt_section.get('compute_type', self.compute_type)
-                self.beam_size = stt_section.getint('beam_size', self.beam_size)
-                self.vad_finalize_sec = stt_section.getfloat('vad_finalize_sec', self.vad_finalize_sec)
-                self.chunk_length_s = stt_section.getfloat('chunk_length_s', self.chunk_length_s)
-                self.follow_up_timer_sec = stt_section.getfloat('follow_up_timer_sec', self.follow_up_timer_sec)
-                self.word_timestamps = stt_section.getboolean('word_timestamps', self.word_timestamps)
-            
-            # Load adaptive section
-            if 'stt.adaptive' in self.config:
-                adaptive_section = self.config['stt.adaptive']
-                self.quiet_dbfs = adaptive_section.getfloat('quiet_dbfs', self.quiet_dbfs)
-                self.noisy_dbfs = adaptive_section.getfloat('noisy_dbfs', self.noisy_dbfs)
-            
-            # Load VAD section
-            if 'stt.vad' in self.config:
-                vad_section = self.config['stt.vad']
-                self.silence_margin_db = vad_section.getfloat('silence_margin_db', self.silence_margin_db)
-                self.energy_delta_db = vad_section.getfloat('energy_delta_db', self.energy_delta_db)
-            
-            # Load service dependencies
-            if 'stt.deps' in self.config:
-                deps_section = self.config['stt.deps']
-                self.logger_url = deps_section.get('logger_url', self.logger_url)
-                self.rms_url = deps_section.get('rms_url', self.rms_url)
-                self.kwd_url = deps_section.get('kwd_url', self.kwd_url)
-                self.llm_url = deps_section.get('llm_url', self.llm_url)
-                self.tts_ws_speak = deps_section.get('tts_ws_speak', self.tts_ws_speak)
-                self.tts_ws_events = deps_section.get('tts_ws_events', self.tts_ws_events)
-            
-            return True
-        except Exception as e:
-            self.log("error", f"Failed to load config: {e}")
-            return False
-    
-    def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
-        """Send log message to Logger service"""
-        try:
-            # Add human-readable timestamp (dd-mm-yy HH:MM:SS format)
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%d-%m-%y %H:%M:%S")
-            
-            payload = {
-                "svc": "STT",
-                "level": level,
-                "message": message,
-            }
+            payload = {"svc": "STT", "level": level, "message": message}
             if event:
                 payload["event"] = event
             if extra:
                 payload["extra"] = extra
-                
-            requests.post(f"{self.logger_url}/log", json=payload, timeout=2.0)
+            requests.post(f"{self.logger_url}/log", json=payload, timeout=1.5)
         except Exception:
-            # Fallback to stdout if logger unavailable
-            print(f"STT       {level.upper():<6}= {message}")
-    
+            print(f"STT {level.upper():<5} {message}")
+
     def log_dialog(self, dialog_id: str, role: str, text: str):
-        """Log dialog line to Logger service"""
         try:
-            payload = {
-                "dialog_id": dialog_id,
-                "role": role,
-                "text": text
-            }
-            requests.post(f"{self.logger_url}/dialog/line", json=payload, timeout=2.0)
+            requests.post(
+                f"{self.logger_url}/dialog/line",
+                json={"dialog_id": dialog_id, "role": role, "text": text},
+                timeout=1.5,
+            )
         except Exception:
             pass
-    
-    def get_current_rms(self) -> Optional[float]:
-        """Get current RMS noise level from RMS service"""
+
+
+    # ---------------
+    # Audio utils
+    # ---------------
+    def _apply_dc_block(self, x: np.ndarray, alpha: float = 0.995) -> np.ndarray:
+        # One-pole high-pass (DC-blocker): y[n] = x[n] - x[n-1] + alpha*y[n-1]
+        y = np.empty_like(x, dtype=np.float32)
+        prev_x = self._dc_prev
+        prev_y = 0.0
+        for i, xi in enumerate(x.astype(np.float32)):
+            yi = xi - prev_x + alpha * prev_y
+            y[i] = yi
+            prev_x = xi
+            prev_y = yi
+        self._dc_prev = prev_x
+        return y
+
+    @staticmethod
+    def _rms(x: np.ndarray) -> float:
+        x = x.astype(np.float32)
+        return float(np.sqrt(np.mean(x * x)) + 1e-12)
+
+    # ---------------
+    # Device resolution
+    # ---------------
+    def _resolve_input_device(self) -> int:
+        """
+        Resolve an input-capable device index using:
+        1) device_name (exact → substring),
+        2) device_index from config (>=0),
+        3) system's default input,
+        4) first input-capable device.
+        """
         try:
-            response = requests.get(f"{self.rms_url}/current-rms", timeout=2.0)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("rms_dbfs")
+            devs = sd.query_devices()
+
+            # 1) by name (exact → substring)
+            name = (self.audio_device_name or "").strip().lower()
+            if name:
+                for i, d in enumerate(devs):
+                    if d.get("max_input_channels", 0) > 0 and d.get("name", "").lower() == name:
+                        return i
+                for i, d in enumerate(devs):
+                    if d.get("max_input_channels", 0) > 0 and name in d.get("name", "").lower():
+                        return i
+
+            # 2) by explicit index
+            if self.audio_device_index is not None and int(self.audio_device_index) >= 0:
+                i = int(self.audio_device_index)
+                if 0 <= i < len(devs) and devs[i].get("max_input_channels", 0) > 0:
+                    return i
+
+            # 3) default input
+            defaults = sd.default.device  # (input, output)
+            if isinstance(defaults, (list, tuple)) and defaults and defaults[0] is not None:
+                i = int(defaults[0])
+                if 0 <= i < len(devs) and devs[i].get("max_input_channels", 0) > 0:
+                    return i
+
+            # 4) first input-capable
+            for i, d in enumerate(devs):
+                if d.get("max_input_channels", 0) > 0:
+                    return i
         except Exception as e:
-            self.log("debug", f"Failed to get RMS: {e}")
-        return None
-    
-    def calculate_vad_threshold(self, noise_dbfs: Optional[float]) -> float:
-        """Calculate VAD threshold based on ambient noise"""
-        if noise_dbfs is None:
-            return -40.0  # Default threshold
-            
-        # Adaptive threshold: quieter environments allow lower thresholds
-        if noise_dbfs <= self.quiet_dbfs:
-            return -50.0  # More sensitive in quiet
-        elif noise_dbfs >= self.noisy_dbfs:
-            return -30.0  # Less sensitive in noise
-        else:
-            # Linear interpolation
-            ratio = (noise_dbfs - self.quiet_dbfs) / (self.noisy_dbfs - self.quiet_dbfs)
-            return -50.0 + ratio * (-30.0 - (-50.0))
-    
-    def load_whisper_model(self) -> bool:
-        """Load faster-whisper model"""
+            self.log("warning", f"Device resolution error: {e}")
+
+        return -1
+
+    def _log_resolved_device(self, when: str = "startup"):
+        idx = self._resolve_input_device()
         try:
-            self.log("info", f"Loading Whisper model: {self.model_size} on {self.device}")
-            
-            self.model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type=self.compute_type
-            )
-            
-            self.log("info", "Whisper model loaded successfully", "model_loaded")
-            return True
-            
-        except Exception as e:
-            self.log("error", f"Failed to load Whisper model: {e}")
-            return False
-    
-    def audio_callback(self, indata, frames, time_info, status):
-        """Audio input callback"""
+            info = sd.query_devices(idx) if idx >= 0 else {}
+        except Exception:
+            info = {}
+        self.log(
+            "info",
+            f"[{when}] Resolved input device → index={idx}, "
+            f"name={info.get('name')}, rate={info.get('default_samplerate')}, "
+            f"max_in={info.get('max_input_channels')}"
+        )
+
+    # ---------------
+    # Audio I/O
+    # ---------------
+    def _audio_callback(self, indata, frames, time_info, status):
         if status:
             self.log("warning", f"Audio callback status: {status}")
-            
-        # Convert to float32 and add to buffer
-        audio_data = indata[:, 0].astype(np.float32)
-        
-        with self.buffer_lock:
-            self.audio_buffer.extend(audio_data)
-    
-    def start_audio_capture(self) -> bool:
-        """Start audio capture stream"""
+        frame = indata[:, 0].copy()  # int16 mono
+        self._raw_queue.append(frame)
+
+    def _start_audio(self) -> bool:
+        """
+        Open an input stream using the resolved device.
+        If no frames arrive within 500ms, retry once on system default (device=None).
+        """
         try:
+            self._raw_queue.clear()
+            self._dc_prev = 0.0
+
+            device_idx = self._resolve_input_device()
+            self.audio_device_index = device_idx  # remember last chosen
+
             self.audio_stream = sd.InputStream(
                 samplerate=self.sample_rate,
                 channels=1,
-                callback=self.audio_callback,
-                blocksize=self.chunk_size,
-                dtype=np.float32
+                dtype=self.dtype,
+                blocksize=self.frame_samples,
+                device=(device_idx if device_idx >= 0 else None),
+                callback=self._audio_callback,
             )
             self.audio_stream.start()
-            self.log("info", "Audio capture started")
+            self.log("info", f"Audio started (device={device_idx}, {self.frame_ms}ms frames)")
+
+            # Warm-up probe: ensure frames arrive (dead-mic guard)
+            t0 = time.time()
+            while not self._raw_queue and (time.time() - t0) < 0.5:
+                time.sleep(0.01)
+
+            if not self._raw_queue:
+                self.log("warning", "No audio frames after 500ms; retrying on system default device=None")
+                try:
+                    if self.audio_stream:
+                        self.audio_stream.stop()
+                        self.audio_stream.close()
+                except Exception:
+                    pass
+                self.audio_stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype=self.dtype,
+                    blocksize=self.frame_samples,
+                    device=None,  # force default (matches test_stt.py behavior)
+                    callback=self._audio_callback,
+                )
+                self.audio_stream.start()
+                self.log("info", "Audio restarted on system default device")
             return True
+
         except Exception as e:
-            self.log("error", f"Failed to start audio capture: {e}")
+            self.log("error", f"Failed to start audio: {e}")
             return False
-    
-    def stop_audio_capture(self):
-        """Stop audio capture stream"""
+
+    def _stop_audio(self):
         if self.audio_stream:
             try:
                 self.audio_stream.stop()
                 self.audio_stream.close()
-                self.audio_stream = None
-                self.log("info", "Audio capture stopped")
             except Exception as e:
-                self.log("warning", f"Error stopping audio capture: {e}")
-    
-    def detect_speech_end(self, audio_chunk: np.ndarray, energy_threshold: float) -> bool:
-        """Simple energy-based VAD for speech end detection"""
-        # Calculate RMS energy
-        energy = np.sqrt(np.mean(audio_chunk ** 2))
-        energy_db = 20 * np.log10(energy + 1e-8)
-        
-        # Use WebRTC VAD if available
-        if self.vad and len(audio_chunk) == 480:  # 30ms at 16kHz
-            # Convert to int16 for WebRTC VAD
-            audio_int16 = (audio_chunk * 32767).astype(np.int16)
-            return not self.vad.is_speech(audio_int16.tobytes(), self.sample_rate)
-        
-        # Fallback: simple energy threshold
-        return energy_db < energy_threshold
-    
-    def capture_and_transcribe(self, dialog_id: str) -> Optional[str]:
-        """Capture audio and transcribe to text"""
+                self.log("warning", f"Error stopping audio: {e}")
+            finally:
+                self.audio_stream = None
+                self.log("info", "Audio stopped")
+
+    # ---------------
+    # VAD capture
+    # ---------------
+    def _capture_utterance_silero(self) -> Optional[np.ndarray]:
+        """
+        State machine:
+        - IDLE/ARM: wait for min_start_frames with p>=start_threshold.
+        - RECORD: accumulate frames, end when tail silence accumulated (p<end_th) for max_silence_ms.
+        - Pre-roll frames preserved; speech_pad added at both ends.
+        """
+        if not self._start_audio():
+            return None
+
         try:
-            # Get adaptive VAD threshold
-            rms_dbfs = self.get_current_rms()
-            energy_threshold = self.calculate_vad_threshold(rms_dbfs)
-            
-            self.log("debug", f"VAD threshold: {energy_threshold:.1f} dBFS (RMS: {rms_dbfs})")
-            
-            # Clear existing buffer
-            with self.buffer_lock:
-                self.audio_buffer.clear()
-            
-            # Start audio capture
-            if not self.start_audio_capture():
-                return None
-            
-            # Collect audio until silence
-            audio_data = []
-            silence_duration = 0
-            chunk_duration = self.chunk_size / self.sample_rate
-            
+            # Init VAD
+            if self.vad is None:
+                self.vad = SileroVAD(sample_rate=self.sample_rate, device="cpu")
+
+            # Derived counters
+            pre_roll_frames = max(1, int(self.vad_pre_roll_ms / self.frame_ms))
+            tail_silence_frames = max(1, int(self.vad_max_silence_ms / self.frame_ms))
+            speech_pad_frames = max(0, int(self.vad_speech_pad_ms / self.frame_ms))
+
+            # Buffers
+            preroll: Deque[np.ndarray] = deque(maxlen=pre_roll_frames)
+            utter: List[np.ndarray] = []
+            tail_silence = 0
+            start_consec = 0
+            started = False
+
             self.log("info", "Listening for speech...")
-            
+
             while not self.stop_flag.is_set():
-                time.sleep(chunk_duration)
-                
-                # Get audio chunk
-                with self.buffer_lock:
-                    if len(self.audio_buffer) < self.chunk_size:
-                        continue
-                    
-                    chunk = np.array(self.audio_buffer[:self.chunk_size])
-                    self.audio_buffer = self.audio_buffer[self.chunk_size:]
-                
-                audio_data.extend(chunk)
-                
-                # Check for speech end
-                if self.detect_speech_end(chunk, energy_threshold):
-                    silence_duration += chunk_duration
-                    if silence_duration >= self.vad_finalize_sec:
-                        break
+                if not self._raw_queue:
+                    time.sleep(self.frame_ms / 1000.0 * 0.5)
+                    continue
+
+                frame_i16 = self._raw_queue.popleft()
+
+                # Optional DC-block + min RMS gate
+                frame_f32 = frame_i16.astype(np.float32)
+                if self.dc_block:
+                    frame_f32 = self._apply_dc_block(frame_f32)
+
+                if self._rms(frame_f32) < self.min_frame_rms:
+                    # Very flat "dead mic" frame; treat as silence for arming.
+                    preroll.append(frame_i16)
+                    if started:
+                        tail_silence += 1
+                    continue
+
+                # Silero prob on original int16 (per frame)
+                p = self.vad.prob(frame_i16)
+
+                if not started:
+                    # Keep preroll fresh
+                    preroll.append(frame_i16)
+
+                    if p >= self.vad_start_threshold:
+                        start_consec += 1
+                    else:
+                        start_consec = 0
+
+                    if start_consec >= self.vad_min_start_frames:
+                        started = True
+                        # promote preroll + current to utter
+                        utter.extend(list(preroll))
+                        utter.append(frame_i16)
+                        tail_silence = 0
+                        preroll.clear()
                 else:
-                    silence_duration = 0
-                
-                # Limit total recording time
-                if len(audio_data) / self.sample_rate > self.chunk_length_s:
-                    self.log("warning", "Maximum recording length reached")
+                    # already recording
+                    utter.append(frame_i16)
+                    if p < self.vad_end_threshold:
+                        tail_silence += 1
+                        if tail_silence >= tail_silence_frames:
+                            break
+                    else:
+                        tail_silence = 0
+
+                # Safety cap
+                max_frames = int(self.chunk_length_s * 1000 / self.frame_ms)
+                if len(utter) > max_frames:
+                    self.log("warning", "Max recording length reached")
                     break
-            
-            # Stop audio capture
-            self.stop_audio_capture()
-            
-            if not audio_data:
-                self.log("warning", "No audio captured")
+
+            if not utter:
+                self.log("warning", "No speech captured")
                 return None
-            
-            # Convert to numpy array
-            audio_array = np.array(audio_data, dtype=np.float32)
-            
-            # Transcribe with Whisper
-            self.log("info", "Transcribing speech...")
-            segments, info = self.model.transcribe(
-                audio_array,
+
+            # Add speech pads at both ends if available
+            pad = np.zeros((self.frame_samples,), dtype=np.int16)
+            for _ in range(speech_pad_frames):
+                utter.insert(0, pad.copy())
+                utter.append(pad.copy())
+
+            # Concatenate and convert to float32 [-1,1] for ASR
+            audio_i16 = np.concatenate(utter).astype(np.int16)
+            audio_f32 = (audio_i16.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
+            return audio_f32
+
+        except Exception as e:
+            self.log("error", f"capture error: {e}")
+            return None
+        finally:
+            self._stop_audio()
+
+    # ---------------
+    # Transcription
+    # ---------------
+    def _transcribe(self, audio_f32: np.ndarray) -> Optional[str]:
+        try:
+            segments, _info = self.model.transcribe(
+                audio_f32,
                 beam_size=self.beam_size,
                 word_timestamps=self.word_timestamps,
                 language="en"
             )
-            
-            # Combine segments into final text
-            transcript = " ".join([segment.text.strip() for segment in segments])
-            
-            if transcript:
-                self.log("info", f"USER: {transcript}", "stt_final_text")
-                return transcript.strip()
-            else:
+            text = " ".join([seg.text.strip() for seg in segments]).strip()
+            if not text:
                 self.log("warning", "Empty transcription")
                 return None
-                
+            self.log("info", f"USER: {text}", "stt_final_text")
+            return text
         except Exception as e:
             self.log("error", f"Transcription error: {e}")
             return None
-        finally:
-            self.stop_audio_capture()
-    
-    async def connect_tts_websockets(self, dialog_id: str) -> bool:
-        """Connect to TTS WebSocket endpoints"""
+
+    # ---------------
+    # TTS / LLM bridge
+    # ---------------
+    async def _connect_tts_ws(self, dialog_id: str) -> bool:
         try:
-            # Connect to speak stream
             self.tts_speak_ws = await websockets.connect(self.tts_ws_speak)
-            
-            # Connect to playback events
-            events_url = f"{self.tts_ws_events}/{dialog_id}"
-            self.tts_events_ws = await websockets.connect(events_url)
-            
+            self.tts_events_ws = await websockets.connect(f"{self.tts_ws_events}/{dialog_id}")
             self.log("debug", "Connected to TTS WebSockets")
             return True
-            
         except Exception as e:
-            self.log("error", f"Failed to connect to TTS WebSockets: {e}")
+            self.log("error", f"TTS WS connect failed: {e}")
             return False
-    
-    async def disconnect_tts_websockets(self):
-        """Disconnect from TTS WebSocket endpoints"""
+
+    async def _disconnect_tts_ws(self):
         try:
             if self.tts_speak_ws:
                 await self.tts_speak_ws.close()
-                self.tts_speak_ws = None
-            
             if self.tts_events_ws:
                 await self.tts_events_ws.close()
-                self.tts_events_ws = None
-                
-            self.log("debug", "Disconnected from TTS WebSockets")
-            
         except Exception as e:
-            self.log("warning", f"Error disconnecting TTS WebSockets: {e}")
-    
-    async def stream_llm_to_tts(self, dialog_id: str, user_text: str) -> bool:
-        """Stream LLM response to TTS via WebSocket"""
+            self.log("warning", f"TTS WS disconnect error: {e}")
+        finally:
+            self.tts_speak_ws = None
+            self.tts_events_ws = None
+
+    async def _stream_llm_to_tts(self, dialog_id: str, user_text: str) -> bool:
         try:
-            # Prepare LLM request
-            llm_payload = LLMCompleteRequest(
-                text=user_text,
-                dialog_id=dialog_id
-            )
-            
-            # Start LLM streaming request
             self.log("info", "Starting LLM completion stream", "llm_stream_started")
-            
-            response = requests.post(
-                f"{self.llm_url}/complete",
-                json=llm_payload.dict(),
-                stream=True,
-                timeout=120.0
-            )
-            
-            if response.status_code != 200:
-                self.log("error", f"LLM request failed: {response.status_code}")
+            r = requests.post(self.llm_complete_url, json={
+                "text": user_text,
+                "dialog_id": dialog_id
+            }, stream=True, timeout=120.0)
+
+            if r.status_code != 200:
+                self.log("error", f"LLM request failed: {r.status_code}")
                 return False
-            
-            # Stream response chunks to TTS
-            full_response = ""
-            
-            for line in response.iter_lines():
+
+            full = ""
+            for line in r.iter_lines():
                 if self.stop_flag.is_set():
                     break
-                    
-                if line:
-                    line_str = line.decode('utf-8')
-                    if line_str.startswith('data: '):
-                        chunk_data = line_str[6:]  # Remove 'data: ' prefix
-                        
-                        if chunk_data.strip() == '[DONE]':
-                            break
-                        
-                        try:
-                            chunk_json = json.loads(chunk_data)
-                            text_chunk = chunk_json.get('text', '')
-                            
-                            if text_chunk and self.tts_speak_ws:
-                                # Send chunk to TTS
-                                await self.tts_speak_ws.send(json.dumps({
-                                    "text_chunk": text_chunk
-                                }))
-                                
-                                full_response += text_chunk
-                                
-                        except json.JSONDecodeError:
-                            continue
-            
-            # Log complete response
-            if full_response:
-                self.log("info", f"ALEXA: {full_response}", "llm_stream_end")
+                if not line:
+                    continue
+                s = line.decode("utf-8")
+                if s.startswith("data: "):
+                    payload = s[6:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        j = json.loads(payload)
+                        chunk = j.get("text", "")
+                        if chunk and self.tts_speak_ws:
+                            await self.tts_speak_ws.send(json.dumps({"text_chunk": chunk}))
+                            full += chunk
+                    except json.JSONDecodeError:
+                        continue
+
+            if full:
+                self.log("info", f"ALEXA: {full}", "llm_stream_end")
                 self.log_dialog(dialog_id, "USER", user_text)
-                self.log_dialog(dialog_id, "ALEXA", full_response)
-            
+                self.log_dialog(dialog_id, "ALEXA", full)
             return True
-            
         except Exception as e:
             self.log("error", f"LLM streaming error: {e}")
             return False
-    
-    async def wait_for_tts_completion(self, dialog_id: str) -> bool:
-        """Wait for TTS playback completion via WebSocket events"""
+
+    async def _wait_tts_done(self, dialog_id: str) -> bool:
         try:
             if not self.tts_events_ws:
                 return False
-            
             self.log("debug", "Waiting for TTS playback completion")
-            
             while not self.stop_flag.is_set():
                 try:
-                    # Wait for event with timeout
-                    message = await asyncio.wait_for(
-                        self.tts_events_ws.recv(), 
-                        timeout=30.0
-                    )
-                    
-                    event_data = json.loads(message)
-                    event_type = event_data.get("event")
-                    
-                    if event_type == "playback_finished":
+                    msg = await asyncio.wait_for(self.tts_events_ws.recv(), timeout=30.0)
+                    ev = json.loads(msg)
+                    et = ev.get("event")
+                    if et == "playback_finished":
                         self.log("info", "TTS playback completed", "tts_playback_finished")
                         return True
-                    elif event_type == "playback_error":
+                    if et == "playback_error":
                         self.log("warning", "TTS playback error")
                         return False
-                        
                 except asyncio.TimeoutError:
                     self.log("warning", "Timeout waiting for TTS completion")
                     return False
                 except json.JSONDecodeError:
                     continue
-            
-            return False
-            
         except Exception as e:
             self.log("error", f"TTS completion wait error: {e}")
             return False
-    
-    def rearm_kwd(self):
-        """Re-arm KWD for next wake word detection"""
+
+    # ---------------
+    # KWD re-arm (state-aware)
+    # ---------------
+    def _rearm_kwd(self):
         try:
-            response = requests.post(f"{self.kwd_url}/start", timeout=5.0)
-            
-            if response.status_code == 200:
+            r = requests.get(self.kwd_state_url, timeout=1.5)
+            if r.status_code != 200:
+                self.log("warning", f"KWD state probe failed: {r.status_code}")
+                return
+            st = (r.json() or {}).get("state", "").upper()
+            if st not in ("READY", "SLEEP"):
+                self.log("info", f"KWD is {st}; skip re-arm")
+                return
+            r2 = requests.post(self.kwd_start_url, timeout=2.0)
+            if r2.status_code == 200:
                 self.log("info", "KWD re-armed successfully")
             else:
-                self.log("warning", f"KWD re-arm failed: {response.status_code}")
-                
+                self.log("warning", f"KWD re-arm failed: {r2.status_code}")
         except Exception as e:
             self.log("warning", f"KWD re-arm error: {e}")
-    
-    async def dialog_worker(self, dialog_id: str):
-        """Main dialog processing worker"""
+
+    # ---------------
+    # Dialog worker
+    # ---------------
+    async def _dialog_worker(self, dialog_id: str):
         try:
-            self.log("info", f"Dialog session started: {dialog_id}", "dialog_turn_started")
-            
+            self.log("info", f"Dialog started: {dialog_id}", "dialog_turn_started")
             # Start dialog in logger
-            requests.post(f"{self.logger_url}/dialog/start", 
-                         json={"dialog_id": dialog_id}, timeout=2.0)
-            
-            # 1. Capture and transcribe user speech
-            user_text = self.capture_and_transcribe(dialog_id)
-            
-            if not user_text:
+            try:
+                requests.post(f"{self.logger_url}/dialog/start", json={"dialog_id": dialog_id}, timeout=1.5)
+            except Exception:
+                pass
+
+            # 1) Capture
+            audio = self._capture_utterance_silero()
+            if audio is None or self.stop_flag.is_set():
                 self.log("warning", "No user speech captured")
                 return
-            
-            # 2. Connect to TTS WebSockets
-            if not await self.connect_tts_websockets(dialog_id):
+
+            # 2) Transcribe
+            text = self._transcribe(audio)
+            if not text:
                 return
-            
-            # 3. Stream LLM response to TTS
-            if not await self.stream_llm_to_tts(dialog_id, user_text):
+
+            # 3) Connect TTS WS
+            if not await self._connect_tts_ws(dialog_id):
                 return
-            
-            # 4. Wait for TTS playback completion
-            if not await self.wait_for_tts_completion(dialog_id):
+
+            # 4) Stream LLM → TTS
+            if not await self._stream_llm_to_tts(dialog_id, text):
                 return
-            
-            # 5. Follow-up timer for multi-turn conversation
-            self.log("debug", f"Starting follow-up timer: {self.follow_up_timer_sec}s")
-            
-            # TODO: Implement follow-up logic if needed
-            # For now, just wait and then end dialog
+
+            # 5) Wait TTS done
+            await self._wait_tts_done(dialog_id)
+
+            # 6) Optional follow-up delay
             await asyncio.sleep(self.follow_up_timer_sec)
-            
+
         except Exception as e:
             self.log("error", f"Dialog worker error: {e}")
         finally:
-            # Cleanup
-            await self.disconnect_tts_websockets()
-            
-            # End dialog in logger
+            await self._disconnect_tts_ws()
+            # End dialog
             try:
-                requests.post(f"{self.logger_url}/dialog/end", 
-                             json={"dialog_id": dialog_id}, timeout=2.0)
+                requests.post(f"{self.logger_url}/dialog/end", json={"dialog_id": dialog_id}, timeout=1.5)
             except Exception:
                 pass
-            
-            # Re-arm KWD
-            self.rearm_kwd()
-            
+            # Rearm wake word
+            self._rearm_kwd()
             # Reset state
             self.active_dialog_id = None
             self.state = STTState.READY
-            self.log("info", f"Dialog session ended: {dialog_id}", "dialog_ended")
-    
+            self.log("info", f"Dialog ended: {dialog_id}", "dialog_ended")
+
     def start_dialog(self, dialog_id: str) -> bool:
-        """Start a new dialog session"""
         if self.state != STTState.READY:
-            self.log("warning", f"Cannot start dialog in state: {self.state}")
+            self.log("warning", f"Cannot start dialog in state {self.state}")
             return False
-        
+        if self.model is None:
+            self.log("warning", "Start rejected: Whisper not loaded yet")
+            return False
         if self.active_dialog_id:
             self.log("warning", f"Dialog already active: {self.active_dialog_id}")
             return False
-        
+
         try:
             self.active_dialog_id = dialog_id
             self.state = STTState.ACTIVE
             self.stop_flag.clear()
-            
-            # Start dialog worker in background
             self.dialog_thread = threading.Thread(
-                target=lambda: asyncio.run(self.dialog_worker(dialog_id)),
+                target=lambda: asyncio.run(self._dialog_worker(dialog_id)),
                 daemon=True
             )
             self.dialog_thread.start()
-            
             return True
-            
         except Exception as e:
             self.log("error", f"Failed to start dialog: {e}")
             self.active_dialog_id = None
             self.state = STTState.READY
             return False
-    
+
     def stop_dialog(self, dialog_id: str, reason: str = "manual") -> bool:
-        """Stop active dialog session"""
         if not self.active_dialog_id or self.active_dialog_id != dialog_id:
             return False
-        
         try:
             self.log("info", f"Stopping dialog: {reason}")
             self.stop_flag.set()
-            
-            # Wait for dialog thread to finish
             if self.dialog_thread and self.dialog_thread.is_alive():
                 self.dialog_thread.join(timeout=5.0)
-            
             self.active_dialog_id = None
             self.state = STTState.READY
-            
             return True
-            
         except Exception as e:
             self.log("error", f"Error stopping dialog: {e}")
             return False
-    
-    async def startup(self):
-        """Service startup logic"""
+
+    # ---------------
+    # Lifecycle
+    # ---------------
+    def _load_asr_model(self) -> bool:
         try:
-            self.log("info", "STT service starting", "service_start")
-            
-            # Load configuration
-            if not self.load_config():
-                self.log("error", "Failed to load configuration")
-                return False
-            
-            # Load Whisper model
-            if not self.load_whisper_model():
-                self.log("error", "Failed to load Whisper model")
-                return False
-            
-            self.state = STTState.READY
-            self.log("info", "STT service ready", "service_ready")
+            self.log("info", f"Loading Whisper model: {self.model_size} on {self.whisper_device}")
+            self.model = WhisperModel(
+                self.model_size,
+                device=self.whisper_device,
+                compute_type=self.compute_type
+            )
+            self.log("info", "Whisper model loaded", "model_loaded")
             return True
-            
         except Exception as e:
-            self.log("error", f"STT startup failed: {e}")
+            self.log("error", f"Failed to load Whisper model: {e}")
+            self.model = None
             return False
-    
-    async def shutdown(self):
-        """Service shutdown logic"""
-        self.log("info", "STT service shutting down")
+
+    async def startup(self):
+        self.log("info", "STT service starting", "service_start")
         
+        # Log resolved audio device at startup (observability)
+        self._log_resolved_device("startup")
+
+        # Lazy-load Whisper in background so /health is reachable
+        def _bg_load():
+            ok = self._load_asr_model()
+            if not ok:
+                self.log("error", "Whisper load failed; /start will be rejected until fixed")
+
+        threading.Thread(target=_bg_load, daemon=True).start()
+
+        # VAD is lazy-loaded on first capture
+        self.state = STTState.READY
+        self.log("info", "STT service ready", "service_ready")
+        return True
+
+    async def shutdown(self):
+        self.log("info", "STT service shutting down")
         # Stop any active dialog
         if self.active_dialog_id:
-            self.stop_flag(self.active_dialog_id, "shutdown")
-        
-        # Stop audio capture
-        self.stop_audio_capture()
+            self.stop_flag.set()
+            try:
+                if self.dialog_thread and self.dialog_thread.is_alive():
+                    self.dialog_thread.join(timeout=5.0)
+            except Exception:
+                pass
+        self._stop_audio()
 
 
-# Global STT instance
+# =========================
+# FastAPI app
+# =========================
 stt_service = STTService()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     await stt_service.startup()
-    yield
-    # Shutdown
-    await stt_service.shutdown()
+    try:
+        yield
+    finally:
+        await stt_service.shutdown()
 
-
-# FastAPI app
 app = FastAPI(
     title="STT Service",
-    description="Speech-to-Text with Dialog Session Management",
-    version="1.0",
+    description="Silero VAD + faster-whisper dialog manager",
+    version="1.3",
     lifespan=lifespan
 )
 
 
 @app.post("/start")
 async def start_dialog(request: StartRequest):
-    """Start a new dialog session"""
     if stt_service.state != STTState.READY:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Service not ready, state: {stt_service.state}"
-        )
-    
+        raise HTTPException(status_code=400, detail=f"Service not ready (state={stt_service.state})")
+    if stt_service.model is None:
+        raise HTTPException(status_code=503, detail="ASR model is still loading")
     if stt_service.start_dialog(request.dialog_id):
         return {"status": "ok", "dialog_id": request.dialog_id}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to start dialog")
+    raise HTTPException(status_code=500, detail="Failed to start dialog")
 
 
 @app.post("/stop")
 async def stop_dialog(request: StopRequest):
-    """Stop active dialog session"""
     reason = request.reason or "manual stop"
-    
     if stt_service.stop_dialog(request.dialog_id, reason):
         return {"status": "ok", "dialog_id": request.dialog_id}
-    else:
-        raise HTTPException(status_code=404, detail="Dialog not found or already stopped")
+    raise HTTPException(status_code=404, detail="Dialog not found or already stopped")
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    status = "ok" if stt_service.state == STTState.READY else "error"
+    """
+    READY and ACTIVE are both healthy. Include state for observability.
+    """
+    status = "ok" if stt_service.state in (STTState.READY, STTState.ACTIVE) else "error"
     return HealthResponse(status=status, state=stt_service.state)
 
 
 @app.get("/state")
 async def get_state():
-    """Get current service state"""
-    return StateResponse(state=stt_service.state)
+    return StateResponse(state=str(stt_service.state))
+
+
+@app.get("/devices")
+async def list_devices():
+    """
+    List input-capable devices (index, name, sample rate, channels).
+    """
+    try:
+        devs = sd.query_devices()
+        items = []
+        for idx, d in enumerate(devs):
+            if d.get("max_input_channels", 0) > 0:
+                items.append({
+                    "index": idx,
+                    "name": d.get("name"),
+                    "default_samplerate": d.get("default_samplerate"),
+                    "max_input_channels": d.get("max_input_channels")
+                })
+        return {"status": "ok", "devices": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/device")
+async def get_chosen_device():
+    """
+    Returns what device STT will actually use if started now (after config/env).
+    """
+    idx = stt_service._resolve_input_device()
+    try:
+        info = sd.query_devices(idx) if idx >= 0 else {}
+    except Exception:
+        info = {}
+    return {"index": idx, "info": info}
 
 
 def main():
-    """Entry point when run as module"""
     uvicorn.run(
         app,
-        host="127.0.0.1",
+        host=stt_service.bind_host,
         port=stt_service.port,
-        log_level="error",  # Suppress uvicorn logs to keep console clean
+        log_level="error",
         access_log=False
     )
 

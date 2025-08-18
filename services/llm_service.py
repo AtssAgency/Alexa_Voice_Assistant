@@ -20,7 +20,6 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, AsyncGenerator
-import configparser
 import re
 
 import requests
@@ -29,6 +28,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
+from .config_loader import app_config
 
 
 class LLMState:
@@ -61,67 +61,37 @@ class WarmupRequest(BaseModel):
 class LLMService:
     def __init__(self):
         self.state = LLMState.INIT
-        self.config: Optional[configparser.ConfigParser] = None
         
-        # Service URLs
-        self.logger_url = "http://127.0.0.1:5000"
-        self.ollama_base_url = "http://127.0.0.1:11434"
+        # --- Config is now clean and type-safe ---
+        self.cfg = app_config.llm
         
-        # Configuration
-        self.port = 5004
-        self.request_timeout_s = 120
-        self.warmup_enabled = True
-        self.warmup_text = "ok"
+        # Service configuration
+        self.bind_host = self.cfg.bind_host
+        self.port = self.cfg.port
+        self.request_timeout_s = self.cfg.request_timeout_s
+        self.warmup_enabled = self.cfg.warmup_enabled
+        self.warmup_text = self.cfg.warmup_text
         
-        # Default sampling parameters
-        self.temperature = 0.6
-        self.top_p = 0.9
-        self.top_k = 40
-        self.repeat_penalty = 1.05
-        self.max_tokens = 512
+        # Dependencies
+        self.logger_url = self.cfg.deps.logger_url
+        self.ollama_base_url = self.cfg.ollama_base_url
         
-        # Modelfile configuration (authoritative)
+        # Default sampling parameters from config
+        self.temperature = self.cfg.temperature
+        self.top_p = self.cfg.top_p
+        self.top_k = self.cfg.top_k
+        self.repeat_penalty = self.cfg.repeat_penalty
+        self.max_tokens = self.cfg.max_tokens
+        
+        # Modelfile configuration (will be loaded from Modelfile, these are fallbacks)
         self.model = "llama3.1:8b-instruct-q4_K_M"
         self.system_prompt = "You are a helpful AI voice assistant. You provide concise, friendly responses to user questions. Keep your answers brief and conversational, as they will be spoken aloud. Avoid using markdown formatting or special characters in your responses."
         
         # Metrics tracking
         self.active_streams = 0
-    
-    def load_config(self) -> bool:
-        """Load configuration from config files"""
-        try:
-            # Load config.ini first for basic settings
-            config_path = Path("config/config.ini")
-            if config_path.exists():
-                self.config = configparser.ConfigParser()
-                self.config.read(config_path)
-                
-                # Load LLM section
-                if 'llm' in self.config:
-                    llm_section = self.config['llm']
-                    self.port = llm_section.getint('port', self.port)
-                    self.ollama_base_url = llm_section.get('ollama_base_url', self.ollama_base_url)
-                    self.request_timeout_s = llm_section.getint('request_timeout_s', self.request_timeout_s)
-                    self.warmup_enabled = llm_section.getboolean('warmup_enabled', self.warmup_enabled)
-                    self.warmup_text = llm_section.get('warmup_text', self.warmup_text)
-                    
-                    # Load default sampling parameters
-                    self.temperature = llm_section.getfloat('temperature', self.temperature)
-                    self.top_p = llm_section.getfloat('top_p', self.top_p)
-                    self.top_k = llm_section.getint('top_k', self.top_k)
-                    self.repeat_penalty = llm_section.getfloat('repeat_penalty', self.repeat_penalty)
-                    self.max_tokens = llm_section.getint('max_tokens', self.max_tokens)
-            
-            # Load Modelfile (authoritative for model and system prompt)
-            if not self.load_modelfile():
-                return False
-                
-            self.log("info", "Configuration loaded successfully", "config_loaded")
-            return True
-            
-        except Exception as e:
-            self.log("error", f"Failed to load config: {e}")
-            return False
+        
+        # Load Modelfile on startup (authoritative for model and system prompt)
+        self.load_modelfile()
     
     def load_modelfile(self) -> bool:
         """Load model and system prompt from config/Modelfile"""
@@ -421,11 +391,6 @@ class LLMService:
         try:
             self.log("info", "LLM service starting", "service_start")
             
-            # Load configuration
-            if not self.load_config():
-                self.state = LLMState.ERROR
-                return False
-            
             # Check Ollama connection
             if not self.check_ollama_connection():
                 self.log("error", "Ollama not available")
@@ -526,8 +491,8 @@ async def warmup(request: WarmupRequest = WarmupRequest()):
 
 @app.post("/reload")
 async def reload_config():
-    """Reload configuration from files"""
-    if llm_service.load_config():
+    """Reload Modelfile configuration"""
+    if llm_service.load_modelfile():
         return {
             "status": "ok",
             "config": {
@@ -539,7 +504,7 @@ async def reload_config():
             }
         }
     else:
-        raise HTTPException(status_code=500, detail="Failed to reload configuration")
+        raise HTTPException(status_code=500, detail="Failed to reload Modelfile")
 
 
 @app.get("/health")

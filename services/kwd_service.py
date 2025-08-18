@@ -9,6 +9,12 @@ FastAPI service on port 5002 that:
 - Manages state: INIT → READY → ACTIVE → TRIGGERED → SLEEP → ACTIVE
 - Provides endpoints for loader coordination and basic diagnostics
 
+Echo/loop prevention (this version):
+- Longer default cooldown (2000 ms)
+- Post-fire debounce window (e.g., 2000 ms) that ignores all detections
+- Re-arm requires a period of silence (e.g., 800–1200 ms) before returning to ACTIVE
+- Optional consecutive-frame requirement before firing (default 2 frames)
+
 Notes:
 - Audio is captured @16 kHz, mono, int16. Detector expects int16 PCM.
 - Chunking uses 80 ms windows (1280 samples) as recommended for stable streaming features.
@@ -16,7 +22,6 @@ Notes:
 - Device selection is configurable via [audio] section.
 """
 
-import os
 import sys
 import time
 import threading
@@ -24,8 +29,6 @@ import random
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-import configparser
-
 import numpy as np
 import sounddevice as sd
 import requests
@@ -33,6 +36,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
+from .config_loader import app_config
 
 # --- Third-party wake word model ---
 try:
@@ -90,43 +94,53 @@ class KWDService:
         # State
         self.state = KWDState.INIT
 
-        # Config
-        self.config: Optional[configparser.ConfigParser] = None
+        # Load configuration from config_loader
+        kwd_config = app_config.kwd
+        kwd_adaptive_config = app_config.kwd_adaptive
+        kwd_deps_config = app_config.kwd_deps
+        audio_config = app_config.audio
 
         # Ports / URLs (bases + routes; backwards compatible with full URLs in base)
-        self.port = 5002
-        self.logger_base = "http://127.0.0.1:5000"
-        self.rms_base = "http://127.0.0.1:5006"
-        self.tts_base = "http://127.0.0.1:5005"  # may already include path in older configs
-        self.stt_base = "http://127.0.0.1:5003"  # may already include path in older configs
+        self.port = kwd_config.port
+        self.logger_base = kwd_deps_config.logger_url
+        self.rms_base = kwd_deps_config.rms_url
+        self.tts_base = kwd_deps_config.tts_url
+        self.stt_base = kwd_deps_config.stt_url
 
         # Routes (can be empty; if base already has a path, we won't append)
-        self.logger_route = "/log"
-        self.rms_route = "/current-rms"
-        self.tts_route = "/speak"
-        self.stt_route = "/start"
+        self.logger_route = kwd_deps_config.logger_route
+        self.rms_route = kwd_deps_config.rms_route
+        self.tts_route = kwd_deps_config.tts_route
+        self.stt_route = kwd_deps_config.stt_route
 
         # Wake word
-        self.model_path = "models/alexa_v0.1.onnx"
+        self.model_path = kwd_config.model_path
 
         # Thresholding (base sensitivity and adaptive multipliers)
-        self.base_threshold = 0.50
+        self.base_threshold = kwd_config.base_threshold
         self.current_threshold = self.base_threshold
-        self.quiet_dbfs = -60.0
-        self.noisy_dbfs = -35.0
-        self.quiet_factor = 0.80
-        self.noisy_factor = 1.25
+        self.quiet_dbfs = kwd_adaptive_config.quiet_dbfs
+        self.noisy_dbfs = kwd_adaptive_config.noisy_dbfs
+        self.quiet_factor = kwd_adaptive_config.quiet_factor
+        self.noisy_factor = kwd_adaptive_config.noisy_factor
 
-        # Cooldown
-        self.cooldown_ms = 1000
+        # Echo / re-trigger guards
+        self.cooldown_ms = kwd_config.cooldown_ms
+        self.debounce_after_tts_ms = kwd_config.debounce_after_tts_ms
+        self.silence_required_ms = kwd_config.silence_required_ms
+        self.rearm_timeout_ms = kwd_config.rearm_timeout_ms
+        self.fire_cons_frames = kwd_config.fire_cons_frames
+
+        self.debounce_until = 0.0               # epoch seconds
         self.last_detection_time = 0.0
         self.detection_lock = threading.Lock()
+        self.in_progress = False                # one-shot guard to prevent parallel side-effects
 
         # Audio settings
-        self.sample_rate = 16000
-        self.frame_ms = 80  # window size for detector
+        self.sample_rate = audio_config.sample_rate
+        self.frame_ms = kwd_config.frame_ms
         self.chunk_size = int(self.sample_rate * self.frame_ms / 1000)  # 1280
-        self.audio_device: Optional[int] = None  # device index or None (default)
+        self.audio_device = audio_config.device_index if audio_config.device_index is not None else None
 
         # Audio stream + buffer (int16)
         self.audio_stream: Optional[sd.InputStream] = None
@@ -134,13 +148,13 @@ class KWDService:
         self.buffer_lock = threading.Lock()
 
         # DC-block (simple one-pole high-pass)
-        self.hp_enabled = True
+        self.hp_enabled = audio_config.dc_block
         self.hp_prev_x = 0.0
         self.hp_prev_y = 0.0
         self.hp_alpha = 0.995  # ~50–70 Hz corner @16k
 
-        # RMS gating for “dead mic” frames
-        self.min_frame_rms = 50  # int16 scale
+        # RMS gating for "dead mic" frames
+        self.min_frame_rms = audio_config.min_frame_rms
 
         # Wake word engine
         self.detector: Optional[Model] = None
@@ -148,15 +162,18 @@ class KWDService:
         self.stop_event = threading.Event()
 
         # Phrases
-        self.yes_phrases = ["Yes?", "Yes Master?", "What's up?", "I'm listening", "Yo", "Here!"]
-        self.greeting_text = "Hi Master. Ready to serve."
+        self.yes_phrases = kwd_config.yes_phrases
+        self.greeting_text = kwd_config.greeting_text
 
         # Adaptive update timer
         self._last_thr_update = 0.0
         self._thr_update_interval_s = 5.0
 
+        # Detector hit counter (for consecutive-frame requirement)
+        self._hit_count = 0
+
     # -----------------------------
-    # URL helpers (fix for 404 regression)
+    # URL helpers
     # -----------------------------
     @staticmethod
     def _compose_url(base: str, route: str) -> str:
@@ -198,74 +215,8 @@ class KWDService:
         return self._compose_url(self.stt_base, self.stt_route)
 
     # -----------------------------
-    # Config / Logging
+    # Logging
     # -----------------------------
-    def load_config(self) -> bool:
-        """Load configuration from config/config.ini (non-fatal: falls back to defaults)."""
-        try:
-            cfg_path = Path("config/config.ini")
-            if not cfg_path.exists():
-                self.log("warning", "config/config.ini not found, using defaults")
-                return True
-
-            cfg = configparser.ConfigParser()
-            cfg.read(cfg_path)
-            self.config = cfg
-
-            # [kwd]
-            if "kwd" in cfg:
-                s = cfg["kwd"]
-                self.model_path = s.get("model_path", self.model_path)
-                self.base_threshold = s.getfloat("base_threshold", self.base_threshold)
-                self.current_threshold = self.base_threshold
-                self.cooldown_ms = s.getint("cooldown_ms", self.cooldown_ms)
-                self.port = s.getint("port", self.port)
-                yes_phrases_str = s.get("yes_phrases", ", ".join(self.yes_phrases))
-                self.yes_phrases = [p.strip() for p in yes_phrases_str.split(",")]
-                self.greeting_text = s.get("greeting_text", self.greeting_text)
-
-            # [kwd.adaptive]
-            if "kwd.adaptive" in cfg:
-                s = cfg["kwd.adaptive"]
-                self.quiet_dbfs = s.getfloat("quiet_dbfs", self.quiet_dbfs)
-                self.noisy_dbfs = s.getfloat("noisy_dbfs", self.noisy_dbfs)
-                self.quiet_factor = s.getfloat("quiet_factor", self.quiet_factor)
-                self.noisy_factor = s.getfloat("noisy_factor", self.noisy_factor)
-
-            # [kwd.deps]
-            if "kwd.deps" in cfg:
-                s = cfg["kwd.deps"]
-                # Bases (may include full paths from older configs)
-                self.logger_base = s.get("logger_url", self.logger_base)
-                self.rms_base = s.get("rms_url", self.rms_base)
-                self.tts_base = s.get("tts_url", self.tts_base)   # keep backward compatibility
-                self.stt_base = s.get("stt_url", self.stt_base)   # keep backward compatibility
-                # Optional routes (empty allowed)
-                self.logger_route = s.get("logger_route", self.logger_route)
-                self.rms_route = s.get("rms_route", self.rms_route)
-                self.tts_route = s.get("tts_route", self.tts_route)
-                self.stt_route = s.get("stt_route", self.stt_route)
-
-            # [audio]
-            if "audio" in cfg:
-                s = cfg["audio"]
-                if s.get("device_index", "").strip():
-                    try:
-                        self.audio_device = int(s.get("device_index"))
-                    except ValueError:
-                        self.audio_device = None
-                else:
-                    self.audio_device = None
-                self.sample_rate = s.getint("sample_rate", self.sample_rate)
-                self.frame_ms = s.getint("frame_ms", self.frame_ms)
-                self.chunk_size = int(self.sample_rate * self.frame_ms / 1000)
-                self.min_frame_rms = s.getint("min_frame_rms", self.min_frame_rms)
-                self.hp_enabled = s.getboolean("dc_block", self.hp_enabled)
-
-            return True
-        except Exception as e:
-            self.log("error", f"Failed to load config: {e}")
-            return False
 
     def log(self, level: str, message: str, event: str = None, extra: Dict[str, Any] = None):
         """Send structured log to Logger or fallback to stdout."""
@@ -404,6 +355,37 @@ class KWDService:
                 self.log("info", "Audio stream stopped")
 
     # -----------------------------
+    # Silence wait for re-arm
+    # -----------------------------
+    def _rms_of_tail_ms(self, tail_ms: int) -> int:
+        """Compute RMS of last 'tail_ms' milliseconds in buffer."""
+        with self.buffer_lock:
+            n = int(self.sample_rate * tail_ms / 1000)
+            if n <= 0 or len(self.audio_buffer) < n:
+                return 0
+            arr = np.array(self.audio_buffer[-n:], dtype=np.int16).astype(np.float32)
+        return int(np.sqrt(np.mean(arr ** 2)))
+
+    def _wait_for_silence(self, required_ms: int, timeout_ms: int) -> bool:
+        """
+        Wait until we observe 'required_ms' of continuous silence (RMS < min_frame_rms).
+        Break early if timeout_ms exceeded. Uses short polling windows to remain responsive.
+        """
+        start = time.time()
+        continuous_ms = 0
+        poll_ms = min(80, required_ms // 4 or 20)  # 20–80 ms polls
+        while (time.time() - start) * 1000.0 < timeout_ms:
+            rms = self._rms_of_tail_ms(poll_ms)
+            if rms < self.min_frame_rms:
+                continuous_ms += poll_ms
+                if continuous_ms >= required_ms:
+                    return True
+            else:
+                continuous_ms = 0
+            time.sleep(poll_ms / 1000.0 * 0.6)  # small sleep, keep responsive
+        return False
+
+    # -----------------------------
     # Detection Loop
     # -----------------------------
     def detection_worker(self):
@@ -411,7 +393,13 @@ class KWDService:
         while not self.stop_event.is_set():
             try:
                 if self.state != KWDState.ACTIVE:
-                    time.sleep(0.1)
+                    time.sleep(0.05)
+                    continue
+
+                # Global debounce window (ignore everything while active)
+                now = time.time()
+                if now < self.debounce_until:
+                    time.sleep(0.01)
                     continue
 
                 # Pull a frame
@@ -427,20 +415,32 @@ class KWDService:
                     continue
 
                 # Frame gating by RMS (dead mic / wrong source)
-                rms = int(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
-                if rms < self.min_frame_rms:
+                frms = int(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                if frms < self.min_frame_rms:
+                    self._hit_count = 0
                     continue
 
                 # Run prediction
                 if self.detector:
                     predictions = self.detector.predict(frame)
-                    for model_name, score in predictions.items():
+                    fired = False
+                    for _, score in predictions.items():
                         if score >= self.current_threshold:
-                            self.handle_wake_detection(float(score))
-                            break
+                            self._hit_count += 1
+                            if self._hit_count >= self.fire_cons_frames:
+                                fired = True
+                                self._hit_count = 0
+                                break
+                        else:
+                            # reset if any head falls below on this frame
+                            self._hit_count = 0
+
+                    if fired:
+                        self.handle_wake_detection(float(score))
+                        # state changes to SLEEP inside handle_wake_detection
+                        continue
 
                 # Adaptive threshold every ~5s
-                now = time.time()
                 if now - self._last_thr_update > self._thr_update_interval_s:
                     self.update_threshold_from_rms()
                     self._last_thr_update = now
@@ -452,11 +452,24 @@ class KWDService:
         self.log("info", "Detection worker stopped")
 
     def handle_wake_detection(self, confidence: float):
-        now = time.time()
+        # one-shot guard to prevent parallel side-effects
         with self.detection_lock:
+            now = time.time()
+
+            # basic cooldown
             if (now - self.last_detection_time) * 1000 < self.cooldown_ms:
                 return
+
+            # hard debounce window (covers speaker playback echo)
+            if now < self.debounce_until:
+                return
+
+            if self.in_progress:
+                return
+            self.in_progress = True
             self.last_detection_time = now
+            # set a post-fire debounce window
+            self.debounce_until = now + (self.debounce_after_tts_ms / 1000.0)
 
         self.state = KWDState.TRIGGERED
         self.log(
@@ -470,17 +483,39 @@ class KWDService:
 
         # Move to SLEEP so we don't double-trigger while TTS/STT spin up
         self.state = KWDState.SLEEP
-        threading.Thread(target=self._cooldown_reattach, daemon=True).start()
 
         # Fire-and-forget side effects
         threading.Thread(target=self.trigger_tts_confirmation, args=(dialog_id,), daemon=True).start()
         threading.Thread(target=self.trigger_stt_dialog, args=(dialog_id,), daemon=True).start()
 
-    def _cooldown_reattach(self):
-        time.sleep(self.cooldown_ms / 1000.0)
-        if self.state == KWDState.SLEEP:
+        # Begin re-arm workflow
+        threading.Thread(target=self._cooldown_and_rearm, daemon=True).start()
+
+    def _cooldown_and_rearm(self):
+        """
+        Wait cooldown, then require a window of silence before re-arming.
+        If silence doesn't arrive before timeout, re-arm anyway (failsafe).
+        """
+        try:
+            time.sleep(self.cooldown_ms / 1000.0)
+
+            # Require continuous silence to avoid echo re-triggers
+            got_silence = self._wait_for_silence(
+                required_ms=self.silence_required_ms,
+                timeout_ms=self.rearm_timeout_ms,
+            )
+
+            if not got_silence:
+                self.log("debug", "Re-arm without silence (timeout reached)")
+
+            # Re-arm
             self.state = KWDState.ACTIVE
-            self.log("debug", "Cooldown done → ACTIVE")
+            self.in_progress = False
+            self.log("debug", "Cooldown + silence satisfied → ACTIVE")
+        except Exception as e:
+            self.in_progress = False
+            self.state = KWDState.ACTIVE
+            self.log("warning", f"Re-arm workflow error: {e}")
 
     # -----------------------------
     # Side Effects: TTS / STT
@@ -535,6 +570,7 @@ class KWDService:
         self.stop_audio_stream()
         if self.detection_thread and self.detection_thread.is_alive():
             self.detection_thread.join(timeout=1.5)
+        self.in_progress = False
         self.log("info", "Wake word detection stopped", "kwd_stopped")
 
     def play_greeting_and_activate(self):
@@ -559,9 +595,6 @@ class KWDService:
     async def startup(self) -> bool:
         try:
             self.log("info", "KWD service starting", "service_start")
-            if not self.load_config():
-                self.log("error", "Configuration load failed")
-                return False
             if not self.load_wake_word_model():
                 self.log("error", "Wake word model load failed")
                 return False
@@ -618,7 +651,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="KWD Service",
     description="Wake Word Detection using openWakeWord",
-    version="1.2",
+    version="1.3",
     lifespan=lifespan,
 )
 
