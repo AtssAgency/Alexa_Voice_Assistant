@@ -13,21 +13,6 @@ class LoggerConfig(BaseModel):
     dialog_prefix: str = "dialog_"
     append_timestamps: bool = True
 
-class RMSDeps(BaseModel):
-    logger_url: str
-
-class RMSConfig(BaseModel):
-    bind_host: str = "127.0.0.1"
-    port: int = 5006
-    sample_rate: int = 16000
-    frame_ms: int = 50
-    window_sec: int = 30
-    ema_alpha: float = 0.2
-    noise_floor_mode: str = "p05"
-    device: str = "default"
-    shared_mode: bool = True
-    stats_interval_sec: int = 5
-    deps: RMSDeps
 
 class KWDAdaptive(BaseModel):
     quiet_dbfs: float = -60.0
@@ -42,8 +27,6 @@ class KWDeps(BaseModel):
     tts_route: str = "/speak"
     stt_url: str  
     stt_route: str = "/start"
-    rms_url: str
-    rms_route: str = "/current-rms"
 
 class AudioConfig(BaseModel):
     device_index: int = -1
@@ -97,7 +80,6 @@ class STTDeps(BaseModel):
     tts_ws_speak: str
     tts_ws_events: str
     kwd_url: str
-    rms_url: str
     
 class STTConfig(BaseModel):
     bind_host: str = "127.0.0.1"
@@ -157,7 +139,7 @@ class LoaderPaths(BaseModel):
     python: str = "python3"
 
 class LoaderConfig(BaseModel):
-    startup_order: str = "logger,rms,kwd,stt,ollama,llm,tts"
+    startup_order: str = "logger,kwd,stt,ollama,llm,tts"
     health_timeout_s: int = 30
     health_interval_ms: int = 200
     restart_backoff_ms: str = "250,500,1000,2000"
@@ -171,7 +153,6 @@ class LoaderConfig(BaseModel):
 class AppConfig(BaseModel):
     """Holds all service configurations."""
     logger: LoggerConfig
-    rms: RMSConfig
     kwd: KWDConfig
     kwd_adaptive: KWDAdaptive
     kwd_deps: KWDeps
@@ -201,10 +182,6 @@ def load_app_config() -> AppConfig:
     # Populate the models
     config_data = {
         "logger": section_to_dict("logger"),
-        "rms": {
-            **section_to_dict("rms"),
-            "deps": section_to_dict("rms.deps")
-        },
         "kwd": section_to_dict("kwd"),
         "kwd_adaptive": section_to_dict("kwd.adaptive"),
         "kwd_deps": section_to_dict("kwd.deps"),

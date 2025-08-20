@@ -105,26 +105,20 @@ class KWDService:
         # Ports / URLs (bases + routes; backwards compatible with full URLs in base)
         self.port = kwd_config.port
         self.logger_base = kwd_deps_config.logger_url
-        self.rms_base = kwd_deps_config.rms_url
         self.tts_base = kwd_deps_config.tts_url
         self.stt_base = kwd_deps_config.stt_url
 
         # Routes (can be empty; if base already has a path, we won't append)
         self.logger_route = kwd_deps_config.logger_route
-        self.rms_route = kwd_deps_config.rms_route
         self.tts_route = kwd_deps_config.tts_route
         self.stt_route = kwd_deps_config.stt_route
 
         # Wake word
         self.model_path = kwd_config.model_path
 
-        # Thresholding (base sensitivity and adaptive multipliers)
+        # Thresholding (static sensitivity - no longer adaptive)
         self.base_threshold = kwd_config.base_threshold
         self.current_threshold = self.base_threshold
-        self.quiet_dbfs = kwd_adaptive_config.quiet_dbfs
-        self.noisy_dbfs = kwd_adaptive_config.noisy_dbfs
-        self.quiet_factor = kwd_adaptive_config.quiet_factor
-        self.noisy_factor = kwd_adaptive_config.noisy_factor
 
         # Echo / re-trigger guards
         self.cooldown_ms = kwd_config.cooldown_ms
@@ -167,9 +161,6 @@ class KWDService:
         self.yes_phrases = kwd_config.yes_phrases
         self.greeting_text = kwd_config.greeting_text
 
-        # Adaptive update timer
-        self._last_thr_update = 0.0
-        self._thr_update_interval_s = 5.0
 
         # Detector hit counter (for consecutive-frame requirement)
         self._hit_count = 0
@@ -180,8 +171,6 @@ class KWDService:
     def _url_logger(self) -> str:
         return compose_url(self.logger_base, self.logger_route)
 
-    def _url_rms(self) -> str:
-        return compose_url(self.rms_base, self.rms_route)
 
     def _url_tts(self) -> str:
         return compose_url(self.tts_base, self.tts_route)
@@ -206,39 +195,6 @@ class KWDService:
             timeout=1.5
         )
 
-    # -----------------------------
-    # RMS → Adaptive threshold
-    # -----------------------------
-    async def get_current_rms_dbfs(self) -> Optional[float]:
-        """Query RMS service (optional)."""
-        try:
-            data = await safe_get(self._url_rms(), timeout=1.0)
-            if data:
-                return data.get("rms_dbfs")
-        except Exception as e:
-            await self.log("debug", f"RMS query failed: {e}")
-        return None
-
-    def _interp_factor(self, noise_dbfs: float) -> float:
-        if noise_dbfs <= self.quiet_dbfs:
-            return self.quiet_factor
-        if noise_dbfs >= self.noisy_dbfs:
-            return self.noisy_factor
-        ratio = (noise_dbfs - self.quiet_dbfs) / (self.noisy_dbfs - self.quiet_dbfs)
-        return self.quiet_factor + ratio * (self.noisy_factor - self.quiet_factor)
-
-    async def update_threshold_from_rms(self):
-        """Recalculate detector threshold from ambient noise."""
-        rms_dbfs = await self.get_current_rms_dbfs()
-        if rms_dbfs is None:
-            return
-        new_thr = self.base_threshold * self._interp_factor(rms_dbfs)
-        if abs(new_thr - self.current_threshold) >= 0.01:
-            self.current_threshold = float(np.clip(new_thr, 0.05, 0.99))
-            await self.log(
-                "debug",
-                f"Adaptive threshold → {self.current_threshold:.3f} (RMS {rms_dbfs:.1f} dBFS)",
-            )
 
     # -----------------------------
     # Model / Audio
@@ -417,17 +373,6 @@ class KWDService:
                         # state changes to SLEEP inside handle_wake_detection
                         continue
 
-                # Adaptive threshold every ~5s
-                if now - self._last_thr_update > self._thr_update_interval_s:
-                    # Run async method from thread using asyncio bridge
-                    try:
-                        loop = asyncio.get_event_loop()
-                        asyncio.run_coroutine_threadsafe(
-                            self.update_threshold_from_rms(), loop
-                        )
-                    except:
-                        pass  # Skip if no event loop available
-                    self._last_thr_update = now
 
             except Exception as e:
                 print(f"KWD       ERROR = Detection worker error: {e}")

@@ -168,9 +168,6 @@ class STTService:
         self.vad_pre_roll_ms = self.cfg.vad.pre_roll_ms
         self.vad_speech_pad_ms = self.cfg.vad.speech_pad_ms
 
-        # Adaptive (from RMS)
-        self.quiet_dbfs = self.cfg.adaptive.quiet_dbfs
-        self.noisy_dbfs = self.cfg.adaptive.noisy_dbfs
 
         # Dependencies
         self.logger_url = self.cfg.deps.logger_url
@@ -179,7 +176,6 @@ class STTService:
         self.tts_ws_events = self.cfg.deps.tts_ws_events
         self.kwd_start_url = self.cfg.deps.kwd_url
         self.kwd_state_url = self.cfg.deps.kwd_url + "/state"  # Construct state URL
-        self.rms_current_url = self.cfg.deps.rms_url
 
         # Runtime holders
         self.model: Optional[WhisperModel] = None

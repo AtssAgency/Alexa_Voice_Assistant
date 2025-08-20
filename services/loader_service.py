@@ -3,7 +3,7 @@
 Loader Service - Process Manager for Voice Assistant Services
 
 CLI/daemon process that:
-- Spawns all microservices in health-gated order (LOGGER → RMS → KWD → STT → LLM → TTS)
+- Spawns all microservices in health-gated order (LOGGER → KWD → STT → LLM → TTS)
 - Health-gates each service before proceeding to the next
 - Restarts crashed services with exponential backoff
 - Reports startup times, VRAM snapshots, and system metrics to Logger
@@ -140,7 +140,7 @@ class LoaderService:
             if not HAVE_CONFIG_LOADER:
                 if 'loader' in self.config:
                     loader_section = self.config['loader']
-                    self.startup_order = [s.strip() for s in loader_section.get('startup_order', 'logger,rms,kwd,stt,llm,tts').split(',')]
+                    self.startup_order = [s.strip() for s in loader_section.get('startup_order', 'logger,kwd,stt,ollama,llm,tts').split(',')]
                     self.health_timeout_s = loader_section.getint('health_timeout_s', 30)
                     self.health_interval_ms = loader_section.getint('health_interval_ms', 200)
                     
