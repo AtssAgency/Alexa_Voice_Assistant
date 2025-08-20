@@ -1,8 +1,8 @@
 # Modelfile for Llama 3.2 8B Instruct Q4 Voice Assistant
 # This file defines the model configuration for Ollama
 
-FROM qwen3:8b-q4_K_M
-#FROM llama3.1:8b-instruct-q4_K_M
+#FROM qwen3:8b-q4_K_M
+FROM llama3.1:8b-instruct-q4_K_M
 
 
 # Model parameters
